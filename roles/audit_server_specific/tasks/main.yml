@@ -1,0 +1,233 @@
+---
+# audit_server_specific - applies the baseline declared in host_vars:
+#   expected_services, expected_ports, backup_checks, database_checks,
+#   certificate_checks, heartbeat_check.
+# Code = how the check works.  host_vars = what this server expects.
+# READ ONLY.
+
+# ================================================================== services
+- name: Record service baseline results
+  vars:
+    _running: "{{ audit_running_services }}"
+    _re: "^({{ audit.service_ignore_patterns | default([]) | join('|') }})$"
+    _unapproved: "{{ _running | reject('match', _re) | difference(audit_allowed_services) | sort }}"
+    _missing: "{{ audit_required_services | difference(_running) | sort }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Services', 'Running services baseline',
+                     'UNKNOWN' if _running | length == 0 else ('PASS' if _unapproved | length == 0 else 'FAIL'),
+                     (_running | length) ~ ' running; not approved: ' ~ ((_unapproved | join(', ')) if _unapproved | length > 0 else 'none'),
+                     'only approved services: ' ~ (audit_allowed_services | join(', ')),
+                     'Could not list running services' if _running | length == 0
+                       else ('All running services are approved' if _unapproved | length == 0 else 'Service(s) running that are not in the approved list'))
+         | audit_add('Services', 'Required services running',
+                     'UNKNOWN' if _running | length == 0 else ('PASS' if _missing | length == 0 else 'CRITICAL'),
+                     ('not running: ' ~ (_missing | join(', '))) if _missing | length > 0 else 'all required services are running',
+                     audit_required_services | join(', '),
+                     'Could not list running services' if _running | length == 0
+                       else ('Required services are running' if _missing | length == 0 else 'Required service(s) are not running')) }}
+
+# =============================================================== listening ports
+- name: Record listening port results
+  vars:
+    _ignore: "{{ audit.listening_ignore_ports | default([]) }}"
+    _approved: "{{ audit_approved_ports | union(_ignore) }}"
+    _ext_lines: "{{ audit_listening_raw | select('search', '[|]ext$') | list }}"
+    _ext: "{{ _ext_lines | map('regex_replace', '[|].*$', '') | unique | sort | list }}"
+    _all: "{{ audit_listening_raw | map('regex_replace', '[|].*$', '') | unique | list }}"
+    _bad: "{{ _ext | difference(_approved) | sort }}"
+    _bad_re: "^({{ _bad | map('regex_escape') | join('|') }})[|]"
+    _detail: >-
+      {{ (_ext_lines | select('match', _bad_re) | map('regex_replace', '[|]ext$', '') | map('replace', '|', ' ') | list)
+         if _bad | length > 0 else [] }}
+    _host_ports: "{{ expected_ports | default([]) }}"
+    _not_listening: "{{ _host_ports | difference(_all) | sort }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Network', 'Listening port baseline',
+                     'UNKNOWN' if audit_listening_raw | length == 0 else ('PASS' if _bad | length == 0 else 'FAIL'),
+                     (_ext | length) ~ ' non-loopback port(s)' ~ ((': unapproved ' ~ (_detail | join('; '))) if _bad | length > 0 else ''),
+                     _approved | join(', '),
+                     'ss returned no data' if audit_listening_raw | length == 0
+                       else ('All listening ports are approved' if _bad | length == 0 else 'Port(s) listening that are not approved'))
+         | audit_add('Network', 'Expected ports listening',
+                     'NOT_APPLICABLE' if _host_ports | length == 0
+                       else ('PASS' if _not_listening | length == 0 else 'WARNING'),
+                     ('not listening: ' ~ (_not_listening | join(', '))) if _not_listening | length > 0
+                       else ('all expected ports are listening' if _host_ports | length > 0 else 'no host-specific ports defined'),
+                     _host_ports | join(', '),
+                     'Approved port(s) are not open - the service may be down' if _not_listening | length > 0 else 'Expected ports are listening') }}
+
+# ===================================================================== backups
+- name: Normalise backup checks
+  ansible.builtin.set_fact:
+    audit_backup_active: >-
+      {{ (([backup_checks] if (backup_checks is mapping) else backup_checks) if backup_checks is defined else [])
+         | rejectattr('enabled', 'equalto', false) | list }}
+
+- name: Look for backup files
+  ansible.builtin.find:
+    paths: "{{ item.path }}"
+    patterns: "{{ item.pattern | default('*') }}"
+    file_type: file
+    recurse: "{{ item.recurse | default(false) | bool }}"
+  loop: "{{ audit_backup_active }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: audit_find_backups
+  failed_when: false
+
+- name: Check backup directories exist
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop: "{{ audit_backup_active }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: audit_stat_backups
+
+- name: Record backup results
+  vars:
+    _bk: "{{ item.0.item }}"
+    _files: "{{ item.0.files | default([]) }}"
+    _isdir: "{{ item.1.stat.exists | default(false) and item.1.stat.isdir | default(false) }}"
+    _newest: "{{ (_files | sort(attribute='mtime') | last) if _files | length > 0 else {} }}"
+    _age_h: "{{ (((audit_now_epoch | int) - (_newest.mtime | default(0) | int)) / 3600) | round(1) }}"
+    _size_mb: "{{ ((_newest.size | default(0) | int) / 1048576) | round(1) }}"
+    _max_h: "{{ _bk.max_age_hours | default(24) }}"
+    _min_mb: "{{ _bk.minimum_size_mb | default(0) }}"
+    _ok: "{{ (_files | length > 0) and ((_age_h | float) <= (_max_h | float)) and ((_size_mb | float) >= (_min_mb | float)) }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Backup', _bk.name | default('Backup ' ~ _bk.path),
+                     'PASS' if (_isdir | bool) and (_ok | bool) else 'CRITICAL',
+                     'directory ' ~ _bk.path ~ ' is missing' if not (_isdir | bool)
+                       else ('no file matching ' ~ (_bk.pattern | default('*')) if _files | length == 0
+                       else ('newest ' ~ (_newest.path | basename) ~ ', age ' ~ _age_h ~ ' h, size ' ~ _size_mb ~ ' MB')),
+                     'newer than ' ~ _max_h ~ ' h and at least ' ~ _min_mb ~ ' MB',
+                     'Backup directory is missing' if not (_isdir | bool)
+                       else ('No backup file found' if _files | length == 0
+                       else ('Backup is current' if (_ok | bool)
+                       else ('Backup is stale' if (_age_h | float) > (_max_h | float) else 'Backup is smaller than the minimum size')))) }}
+  loop: "{{ audit_find_backups.results | default([]) | zip(audit_stat_backups.results | default([])) | list }}"
+  loop_control:
+    label: "{{ item.0.item.path | default('') }}"
+
+- name: Record that no backup check is defined
+  when: audit_backup_active | length == 0
+  ansible.builtin.set_fact:
+    audit_results: "{{ audit_results | audit_add('Backup', 'Backup', 'NOT_APPLICABLE', 'no backup check defined', 'n/a', 'No backup_checks in host_vars for this server') }}"
+
+# ==================================================================== database
+- name: Record database check result
+  vars:
+    _db: "{{ database_checks | default({}) }}"
+    _svc: "{{ _db.service | default('') }}"
+    _port: "{{ _db.port | default('') }}"
+    _svc_up: "{{ _svc in audit_running_services }}"
+    _port_up: "{{ (_port | string | length == 0) or ((_port | string ~ '/tcp') in (audit_listening_raw | map('regex_replace', '[|].*$', '') | list)) }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Database', 'Database service' ~ ((' ' ~ _svc) if _svc | length > 0 else ''),
+                     'NOT_APPLICABLE' if not (_db.enabled | default(false) | bool)
+                       else ('PASS' if (_svc_up | bool) and (_port_up | bool) else 'CRITICAL'),
+                     'no database check defined' if not (_db.enabled | default(false) | bool)
+                       else (_svc ~ (' running' if (_svc_up | bool) else ' NOT running')
+                             ~ ((', port ' ~ _port ~ (' listening' if (_port_up | bool) else ' NOT listening')) if _port | string | length > 0 else '')),
+                     'n/a' if not (_db.enabled | default(false) | bool)
+                       else ('service running' ~ ((' and port ' ~ _port ~ ' listening') if _port | string | length > 0 else '')),
+                     'No database_checks in host_vars for this server' if not (_db.enabled | default(false) | bool)
+                       else ('Database is up' if (_svc_up | bool) and (_port_up | bool) else 'Database service or port is down')) }}
+
+# ================================================================ certificates
+- name: Inspect certificate files
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    if [ ! -r "$CERT_PATH" ]; then echo "EXISTS=no"; exit 0; fi
+    echo "EXISTS=yes"
+    end=$(openssl x509 -noout -enddate -in "$CERT_PATH" 2>/dev/null | cut -d= -f2)
+    if [ -z "$end" ]; then echo "PARSE=failed"; exit 0; fi
+    endts=$(date -d "$end" +%s 2>/dev/null)
+    now=$(date +%s)
+    echo "NOTAFTER=${end}"
+    if [ -z "$endts" ]; then echo "PARSE=failed"; exit 0; fi
+    echo "DAYS=$(( (endts - now) / 86400 ))"
+    if [ "$endts" -le "$now" ]; then echo "EXPIRED=yes"; else echo "EXPIRED=no"; fi
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  environment:
+    CERT_PATH: "{{ item.path }}"
+  loop: "{{ (certificate_checks | default({})).certificates | default([]) if ((certificate_checks | default({})).enabled | default(false) | bool) else [] }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: audit_cmd_certs
+  changed_when: false
+  failed_when: false
+
+- name: Record certificate results
+  vars:
+    _c: "{{ item.item }}"
+    _kv: "{{ item.stdout | default('') | audit_kv }}"
+    _exists: "{{ (_kv.EXISTS | default('')) == 'yes' }}"
+    _parse_ok: "{{ _kv.DAYS is defined }}"
+    _days: "{{ _kv.DAYS | default('0') | int }}"
+    _expired: "{{ (_kv.EXPIRED | default('no')) == 'yes' }}"
+    _warn: "{{ _c.warning_days | default(30) | int }}"
+    _crit: "{{ _c.critical_days | default(7) | int }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Certificates', 'Certificate ' ~ (_c.name | default(_c.path)),
+                     'CRITICAL' if not (_exists | bool)
+                       else ('UNKNOWN' if not (_parse_ok | bool)
+                       else ('CRITICAL' if (_expired | bool) or _days < _crit else ('WARNING' if _days < _warn else 'PASS'))),
+                     _c.path ~ ' not found or not readable' if not (_exists | bool)
+                       else ('not a readable X.509 certificate' if not (_parse_ok | bool)
+                       else ('expires ' ~ (_kv.NOTAFTER | default('')) ~ ' (' ~ _days ~ ' days)')),
+                     'valid for more than ' ~ _warn ~ ' days',
+                     'Certificate file is missing' if not (_exists | bool)
+                       else ('Could not parse the certificate' if not (_parse_ok | bool)
+                       else ('Certificate has expired' if (_expired | bool)
+                       else ('Expires very soon' if _days < _crit else ('Expiry approaching' if _days < _warn else 'Valid'))))) }}
+  loop: "{{ audit_cmd_certs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.path | default('') }}"
+
+- name: Record that no certificate check is defined
+  when: (audit_cmd_certs.results | default([]) | length) == 0
+  ansible.builtin.set_fact:
+    audit_results: "{{ audit_results | audit_add('Certificates', 'Certificate expiry', 'NOT_APPLICABLE', 'no certificate check defined', 'n/a', 'No certificate_checks in host_vars for this server') }}"
+
+# ================================================================== heartbeat
+# Reference implementation of the "add a server-specific check" example in the SOP.
+- name: Check heartbeat file
+  when: (heartbeat_check | default({})).enabled | default(false) | bool
+  ansible.builtin.stat:
+    path: "{{ heartbeat_check.path }}"
+  register: audit_stat_heartbeat
+
+- name: Record heartbeat result
+  when: (heartbeat_check | default({})).enabled | default(false) | bool
+  vars:
+    _hb: "{{ heartbeat_check }}"
+    _st: "{{ audit_stat_heartbeat.stat | default({}) }}"
+    _age_min: "{{ (((audit_now_epoch | int) - (_st.mtime | default(0) | int)) / 60) | round(1) }}"
+    _max: "{{ _hb.max_age_minutes | default(15) }}"
+    _ok: "{{ (_st.exists | default(false)) and ((_age_min | float) <= (_max | float)) }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Application', _hb.name | default('Heartbeat ' ~ _hb.path),
+                     'PASS' if (_ok | bool) else 'CRITICAL',
+                     ('age ' ~ _age_min ~ ' min') if (_st.exists | default(false)) else (_hb.path ~ ' is missing'),
+                     'newer than ' ~ _max ~ ' min',
+                     'Heartbeat is current' if (_ok | bool) else 'Heartbeat file is missing or stale') }}
+
+- name: Mark server-specific checks as complete
+  ansible.builtin.set_fact:
+    audit_server_done: true

@@ -1,0 +1,42 @@
+---
+# Copy to host_vars/<inventory host name>.yml  (e.g. RHEL-APP04.yml)
+server_role:
+  - application
+
+expected_services:
+  allowed: [sshd, chronyd, firewalld, myapp]
+  # required: [sshd, myapp]        # defaults to "allowed"
+
+expected_ports:
+  - 22/tcp
+  - 8443/tcp
+
+directory_checks:
+  - path: /var/log
+    warning: 70
+    critical: 85
+  - path: /opt/myapp
+    warning: 80
+    critical: 90
+
+# Application heartbeat file must be newer than 15 minutes
+heartbeat_check:
+  enabled: true
+  name: myapp heartbeat
+  path: /opt/myapp/heartbeat
+  max_age_minutes: 15
+
+# backup_checks may be a single mapping or a list of mappings
+# backup_checks:
+#   enabled: true
+#   name: App backup
+#   path: /backup/app
+#   pattern: "*.tar.gz"
+#   max_age_hours: 24
+#   minimum_size_mb: 50
+#   recurse: false
+#
+# certificate_checks:
+#   enabled: true
+#   certificates:
+#     - {name: App certificate, path: /etc/pki/tls/certs/app.crt, warning_days: 30, critical_days: 7}

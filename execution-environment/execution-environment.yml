@@ -1,0 +1,14 @@
+---
+# OPTIONAL: build an AWX execution environment that already contains the
+# collections, so project syncs and jobs never need Internet access.
+#   pip install ansible-builder
+#   ansible-builder build -f execution-environment.yml -t registry.example.local/awx-ee/rhel-audit-ee:1.0
+#   podman push registry.example.local/awx-ee/rhel-audit-ee:1.0
+# Then register it in AWX: Administration -> Execution Environments.
+# Replace base_image with the AWX EE image mirrored in your internal registry.
+version: 3
+images:
+  base_image:
+    name: registry.example.local/awx-ee/awx-ee:latest
+dependencies:
+  galaxy: requirements.yml

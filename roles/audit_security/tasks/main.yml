@@ -1,0 +1,484 @@
+---
+# audit_security - password policy, accounts, SSH, SELinux, firewall, sudo,
+# scheduled jobs and authentication failures. READ ONLY.
+# Every result is appended with: audit_results | audit_add(category, check, status, actual, expected, finding)
+
+# ============================================================== password policy
+- name: Read password policy settings
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    LD=$(awk '
+      /^[[:space:]]*PASS_MAX_DAYS[[:space:]]/ { mx = $2 }
+      /^[[:space:]]*PASS_MIN_DAYS[[:space:]]/ { mn = $2 }
+      /^[[:space:]]*PASS_WARN_AGE[[:space:]]/ { wn = $2 }
+      END { printf "%s|%s|%s", mx, mn, wn }' /etc/login.defs 2>/dev/null)
+    echo "LOGINDEFS=${LD}"
+    MC=$(awk -F= '/^[[:space:]]*minlen[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); v = $2 } END { print v }' \
+         /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf 2>/dev/null)
+    echo "MINLEN_CONF=${MC}"
+    MP=$(grep -hE '^[[:space:]]*password[[:space:]].*pam_pwquality\.so' /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null \
+         | grep -Eo 'minlen=-?[0-9]+' | head -1 | cut -d= -f2)
+    echo "MINLEN_PAM=${MP}"
+    PH=$(grep -hE '^[[:space:]]*password[[:space:]].*pam_pwhistory\.so' /etc/pam.d/system-auth 2>/dev/null | head -1)
+    if [ -n "$PH" ]; then echo "PWHIST_PRESENT=yes"; else echo "PWHIST_PRESENT=no"; fi
+    R=$(printf '%s\n' "$PH" | grep -Eo 'remember=[0-9]+' | head -1 | cut -d= -f2)
+    if [ -z "$R" ]; then
+      R=$(awk -F= '/^[[:space:]]*remember[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); v = $2 } END { print v }' /etc/security/pwhistory.conf 2>/dev/null)
+    fi
+    echo "PWHIST_REMEMBER=${R}"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_pwpolicy
+  changed_when: false
+  failed_when: false
+
+- name: Record password policy results
+  vars:
+    _kv: "{{ audit_cmd_pwpolicy.stdout | default('') | audit_kv }}"
+    _ld: "{{ (_kv.LOGINDEFS | default('||')).split('|') }}"
+    _pw: "{{ security_baseline.password }}"
+    _maxd: "{{ _ld[0] | default('') | string | trim }}"
+    _mind: "{{ _ld[1] | default('') | string | trim }}"
+    _warn: "{{ _ld[2] | default('') | string | trim }}"
+    _ml_pam: "{{ _kv.MINLEN_PAM | default('') }}"
+    _ml_conf: "{{ _kv.MINLEN_CONF | default('') }}"
+    _minlen: "{{ _ml_pam if (_ml_pam | length > 0) else (_ml_conf if (_ml_conf | length > 0) else '8') }}"
+    _minlen_src: "{{ 'pam_pwquality argument' if (_ml_pam | length > 0) else ('pwquality.conf' if (_ml_conf | length > 0) else 'libpwquality default') }}"
+    _hist_present: "{{ _kv.PWHIST_PRESENT | default('no') }}"
+    _hist: "{{ _kv.PWHIST_REMEMBER | default('') }}"
+    _ok_max: "{{ (_maxd | int) > 0 and (_maxd | int) <= (_pw.max_days | int) }}"
+    _ok_min: "{{ (_mind | length > 0) and (_mind | int) >= (_pw.min_days | int) }}"
+    _ok_warn: "{{ (_warn | length > 0) and (_warn | int) >= (_pw.warn_days | int) }}"
+    _ok_len: "{{ (_minlen | int) >= (_pw.min_length | int) }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Password policy', 'Maximum password age (PASS_MAX_DAYS)',
+                     'PASS' if (_ok_max | bool) else 'FAIL',
+                     _maxd if _maxd | length > 0 else 'not set',
+                     '1 to ' ~ _pw.max_days ~ ' days',
+                     'Meets baseline' if (_ok_max | bool) else 'Passwords do not expire within the approved period')
+         | audit_add('Password policy', 'Minimum password age (PASS_MIN_DAYS)',
+                     'PASS' if (_ok_min | bool) else 'FAIL',
+                     _mind if _mind | length > 0 else 'not set',
+                     '>= ' ~ _pw.min_days ~ ' days',
+                     'Meets baseline' if (_ok_min | bool) else 'Below the approved minimum')
+         | audit_add('Password policy', 'Password expiry warning (PASS_WARN_AGE)',
+                     'PASS' if (_ok_warn | bool) else 'FAIL',
+                     _warn if _warn | length > 0 else 'not set',
+                     '>= ' ~ _pw.warn_days ~ ' days',
+                     'Meets baseline' if (_ok_warn | bool) else 'Below the approved warning period')
+         | audit_add('Password policy', 'Minimum password length',
+                     'PASS' if (_ok_len | bool) else 'FAIL',
+                     _minlen ~ ' (' ~ _minlen_src ~ ')',
+                     '>= ' ~ _pw.min_length,
+                     'Meets baseline' if (_ok_len | bool) else 'Below the approved minimum length')
+         | audit_add('Password policy', 'Password history (remember)',
+                     'FAIL' if _hist_present != 'yes'
+                       else ('WARNING' if _hist | length == 0
+                       else ('PASS' if (_hist | int) >= (_pw.remember | int) else 'FAIL')),
+                     'pam_pwhistory not configured' if _hist_present != 'yes'
+                       else (_hist if _hist | length > 0 else 'enabled, remember not set (module default)'),
+                     '>= ' ~ _pw.remember,
+                     'Password history is not enforced in system-auth' if _hist_present != 'yes'
+                       else ('Cannot determine the remember value' if _hist | length == 0
+                       else ('Meets baseline' if (_hist | int) >= (_pw.remember | int) else 'Below the approved history depth'))) }}
+
+# ================================================================== accounts
+- name: Inspect local accounts (no password hashes are collected)
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    UID_MIN=$(awk '/^[[:space:]]*UID_MIN[[:space:]]/ { print $2 }' /etc/login.defs 2>/dev/null)
+    UID_MIN=${UID_MIN:-1000}
+    TODAY=$(( $(date +%s) / 86400 ))
+    awk -F: -v min="$UID_MIN" -v today="$TODAY" -v maxd="$AUDIT_MAX_DAYS" '
+      NR == FNR { hash[$1] = $2; last[$1] = $3; maxage[$1] = $5; next }
+      {
+        user = $1; uid = $3; shell = $7
+        total++
+        if (uid == 0 && user != "root") uid0 = uid0 user " "
+        if ((user in hash) && hash[user] == "") empty = empty user " "
+        if ((uid >= min && uid < 65534) || uid == 0) {
+          if (shell !~ /(nologin|false|sync|shutdown|halt)$/) {
+            inter = inter user " "
+            h = hash[user]
+            if (h ~ /^[!*]/) {
+              locked = locked user " "
+            } else if (user in hash) {
+              age = today - last[user]; mx = maxage[user]
+              if (mx == "" || mx + 0 >= 99999 || (maxd + 0 > 0 && mx + 0 > maxd + 0)) {
+                aging = aging user "(max=" (mx == "" ? "none" : mx) ") "
+              } else if (age > mx + 0) {
+                over = age - mx
+                aging = aging user "(expired " over " days ago) "
+              }
+            }
+          }
+        }
+      }
+      END {
+        print "TOTAL=" total + 0
+        print "UID0=" uid0
+        print "EMPTYPW=" empty
+        print "INTERACTIVE=" inter
+        print "LOCKED=" locked
+        print "AGING=" aging
+      }' /etc/shadow /etc/passwd 2>/dev/null
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  environment:
+    AUDIT_MAX_DAYS: "{{ security_baseline.password.max_days }}"
+  register: audit_cmd_accounts
+  changed_when: false
+  failed_when: false
+
+- name: Record account results
+  vars:
+    _kv: "{{ audit_cmd_accounts.stdout | default('') | audit_kv }}"
+    _ok: "{{ _kv.TOTAL is defined }}"
+    _uid0: "{{ _kv.UID0 | default('') | trim }}"
+    _empty: "{{ _kv.EMPTYPW | default('') | trim }}"
+    _inter: "{{ (_kv.INTERACTIVE | default('')).split() }}"
+    _locked: "{{ _kv.LOCKED | default('') | trim }}"
+    _aging: "{{ _kv.AGING | default('') | trim }}"
+    _has_ap: "{{ approved_interactive_users is defined }}"
+    _approved: "{{ approved_interactive_users | default([]) }}"
+    _extra: "{{ (_inter | difference(_approved) | sort) if (_has_ap | bool) else [] }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Accounts', 'Accounts with UID 0 other than root',
+                     'UNKNOWN' if not (_ok | bool) else ('PASS' if _uid0 | length == 0 else 'CRITICAL'),
+                     _uid0 if _uid0 | length > 0 else 'none',
+                     'root only',
+                     'Cannot read /etc/passwd or /etc/shadow' if not (_ok | bool)
+                       else ('Only root has UID 0' if _uid0 | length == 0 else 'Additional superuser account(s) found'))
+         | audit_add('Accounts', 'Accounts with an empty password',
+                     'UNKNOWN' if not (_ok | bool) else ('PASS' if _empty | length == 0 else 'CRITICAL'),
+                     _empty if _empty | length > 0 else 'none',
+                     'none',
+                     'Cannot read /etc/shadow' if not (_ok | bool)
+                       else ('No empty passwords' if _empty | length == 0 else 'Account(s) can log in without a password'))
+         | audit_add('Accounts', 'Interactive accounts',
+                     'UNKNOWN' if not (_ok | bool)
+                       else ('FAIL' if (_extra | length > 0) else 'PASS'),
+                     (_inter | length) ~ ' account(s): ' ~ (_inter | join(', ')),
+                     (_approved | join(', ')) if (_has_ap | bool) else 'no approved list defined (inventory only)',
+                     'Cannot read account data' if not (_ok | bool)
+                       else (('Not in approved_interactive_users: ' ~ (_extra | join(', '))) if (_extra | length > 0)
+                       else ('Matches approved list' if (_has_ap | bool)
+                             else 'Inventory only - define approved_interactive_users in host_vars to enforce')))
+         | audit_add('Accounts', 'Locked interactive accounts',
+                     'UNKNOWN' if not (_ok | bool) else 'PASS',
+                     _locked if _locked | length > 0 else 'none',
+                     'informational',
+                     'Inventory of interactive accounts whose password is locked') 
+         | audit_add('Accounts', 'Password aging of interactive accounts',
+                     'UNKNOWN' if not (_ok | bool) else ('PASS' if _aging | length == 0 else 'WARNING'),
+                     _aging if _aging | length > 0 else 'all within policy',
+                     'password maximum age <= ' ~ security_baseline.password.max_days ~ ' days and not expired',
+                     'Cannot read /etc/shadow' if not (_ok | bool)
+                       else ('Aging metadata meets policy' if _aging | length == 0
+                             else 'Account(s) with no or too long maximum age, or an expired password')) }}
+
+# ====================================================================== SSH
+- name: Read the effective SSH daemon configuration
+  ansible.builtin.command: sshd -T
+  register: audit_cmd_sshd
+  changed_when: false
+  failed_when: false
+
+- name: Record SSH hardening results
+  when: (audit_cmd_sshd.rc | default(1)) == 0
+  vars:
+    _opt: "{{ item.key | replace('_', '') | lower }}"
+    _line: "{{ audit_cmd_sshd.stdout_lines | select('match', '^' ~ _opt ~ ' ') | first | default('') }}"
+    _actual: "{{ (_line.split(' ', 1)[1] | default('not reported')) if (_line | length > 0) else 'not reported' }}"
+    _exp: "{{ item.value if (item.value is sequence and item.value is not string) else [item.value] }}"
+    _expn: >-
+      {{ _exp | map('string') | map('lower') | map('replace', 'true', 'yes') | map('replace', 'false', 'no') | list }}
+    _ok: "{{ (_actual | lower) in _expn }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('SSH hardening', 'sshd ' ~ _opt,
+                     'PASS' if (_ok | bool) else 'FAIL',
+                     _actual, _expn | join(' or '),
+                     'Meets baseline' if (_ok | bool) else 'Effective sshd setting differs from the approved baseline') }}
+  loop: "{{ security_baseline.ssh | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Record SSH failure to read configuration
+  when: (audit_cmd_sshd.rc | default(1)) != 0
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('SSH hardening', 'sshd effective configuration', 'UNKNOWN',
+                     audit_cmd_sshd.stderr | default('sshd -T failed') | string | truncate(200),
+                     'sshd -T succeeds', 'Could not read the effective sshd configuration') }}
+
+# =================================================================== SELinux
+- name: Read SELinux state
+  ansible.builtin.shell: |
+    {% raw %}
+    echo "MODE=$(getenforce 2>/dev/null)"
+    echo "CONFIG=$(awk -F= '/^SELINUX=/ { print $2 }' /etc/selinux/config 2>/dev/null)"
+    out=$(ausearch -m avc -ts "$AVC_WINDOW" 2>&1); rc=$?
+    echo "AVC_RC=${rc}"
+    echo "AVC_COUNT=$(printf '%s\n' "$out" | grep -c '^type=AVC')"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  environment:
+    AVC_WINDOW: "{{ audit.avc_window | default('yesterday') }}"
+  register: audit_cmd_selinux
+  changed_when: false
+  failed_when: false
+
+- name: Record SELinux results
+  vars:
+    _kv: "{{ audit_cmd_selinux.stdout | default('') | audit_kv }}"
+    _want: "{{ security_baseline.selinux.mode | lower }}"
+    _mode: "{{ _kv.MODE | default('') | lower }}"
+    _conf: "{{ _kv.CONFIG | default('') | lower }}"
+    _avc_rc: "{{ _kv.AVC_RC | default('127') }}"
+    _avc: "{{ _kv.AVC_COUNT | default('0') | int }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('SELinux', 'SELinux mode',
+                     'UNKNOWN' if _mode | length == 0
+                       else ('PASS' if _mode == _want else ('CRITICAL' if _mode == 'disabled' else 'FAIL')),
+                     _mode if _mode | length > 0 else 'getenforce not available',
+                     _want,
+                     'Could not determine the SELinux mode' if _mode | length == 0
+                       else ('Meets baseline' if _mode == _want else 'Running mode differs from baseline'))
+         | audit_add('SELinux', 'SELinux persistent configuration',
+                     'UNKNOWN' if _conf | length == 0 else ('PASS' if _conf == _want else 'FAIL'),
+                     _conf if _conf | length > 0 else 'not readable',
+                     _want,
+                     'Could not read /etc/selinux/config' if _conf | length == 0
+                       else ('Persistent setting meets baseline' if _conf == _want else 'Setting would change at next reboot'))
+         | audit_add('SELinux', 'SELinux AVC denials (' ~ (audit.avc_window | default('yesterday')) ~ ')',
+                     'UNKNOWN' if _avc_rc not in ['0', '1'] else ('PASS' if _avc == 0 else 'WARNING'),
+                     (_avc ~ ' denial(s)') if _avc_rc in ['0', '1'] else 'ausearch unavailable or auditd log unreadable',
+                     '0 denials',
+                     'Could not query the audit log' if _avc_rc not in ['0', '1']
+                       else ('No recent denials' if _avc == 0 else 'Review recent AVC denials with ausearch -m avc')) }}
+
+# =================================================================== firewall
+- name: Read firewalld state and rules
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    if ! command -v firewall-cmd >/dev/null 2>&1; then echo "STATE=missing"; exit 0; fi
+    if systemctl is-active --quiet firewalld; then echo "STATE=active"; else echo "STATE=inactive"; fi
+    echo "ENABLED=$(systemctl is-enabled firewalld 2>/dev/null)"
+    if systemctl is-active --quiet firewalld; then
+      zones=$(firewall-cmd --get-active-zones 2>/dev/null | grep -v '^[[:space:]]')
+      ports=""; services=""; sources=""; rich=""
+      for z in $zones; do
+        ports="$ports $(firewall-cmd --zone="$z" --list-ports 2>/dev/null)"
+        services="$services $(firewall-cmd --zone="$z" --list-services 2>/dev/null)"
+        sources="$sources $(firewall-cmd --zone="$z" --list-sources 2>/dev/null)"
+        rich="$rich $(firewall-cmd --zone="$z" --list-rich-rules 2>/dev/null | grep -c .)"
+      done
+      echo "ZONES=$(echo $zones)"
+      echo "PORTS=$(echo $ports | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+      echo "SERVICES=$(echo $services | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+      echo "SOURCES=$(echo $sources | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+      echo "RICH=$(echo $rich | awk '{ for (i = 1; i <= NF; i++) s += $i; print s + 0 }')"
+    fi
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_firewall
+  changed_when: false
+  failed_when: false
+
+- name: Record firewall results
+  vars:
+    _kv: "{{ audit_cmd_firewall.stdout | default('') | audit_kv }}"
+    _state: "{{ _kv.STATE | default('unknown') }}"
+    _need: "{{ firewall_baseline.require_firewalld | default(true) | bool }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Firewall', 'firewalld state',
+                     ('PASS' if (_kv.ENABLED | default('')) == 'enabled' else 'WARNING') if _state == 'active'
+                       else (('FAIL' if (_need | bool) else 'NOT_APPLICABLE') if _state in ['inactive', 'missing'] else 'UNKNOWN'),
+                     'firewalld ' ~ _state ~ ', ' ~ (_kv.ENABLED | default('enablement unknown')),
+                     'active and enabled' if (_need | bool) else 'not required',
+                     ('Running, but not enabled at boot' if (_kv.ENABLED | default('')) != 'enabled' else 'Running and enabled') if _state == 'active'
+                       else ('firewalld is not running' if _state == 'inactive'
+                       else ('firewall-cmd is not installed' if _state == 'missing' else 'Could not determine firewalld state'))) }}
+
+- name: Record firewall rule baseline results
+  when: (audit_cmd_firewall.stdout | default('') | audit_kv).STATE | default('') == 'active'
+  vars:
+    _kv: "{{ audit_cmd_firewall.stdout | default('') | audit_kv }}"
+    _extra: "{{ firewall_baseline_extra | default({}) }}"
+    _ports: "{{ (_kv.PORTS | default('')).split() }}"
+    _services: "{{ (_kv.SERVICES | default('')).split() }}"
+    _sources: "{{ (_kv.SOURCES | default('')).split() }}"
+    _allow_ports: >-
+      {{ (firewall_baseline.allowed_ports | default([])) | union(audit_approved_ports) | union(_extra.allowed_ports | default([])) | unique | list }}
+    _allow_services: >-
+      {{ (firewall_baseline.allowed_services | default([])) | union(_extra.allowed_services | default([])) | unique | list }}
+    _allow_sources: >-
+      {{ (firewall_baseline.allowed_sources | default([])) | union(_extra.allowed_sources | default([])) | unique | list }}
+    _bad_ports: "{{ _ports | difference(_allow_ports) | sort }}"
+    _bad_services: "{{ _services | difference(_allow_services) | sort }}"
+    _bad_sources: "{{ _sources | difference(_allow_sources) | sort }}"
+    _rich: "{{ _kv.RICH | default('0') | int }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Firewall', 'Firewall ports baseline',
+                     'PASS' if _bad_ports | length == 0 else 'FAIL',
+                     (_ports | join(', ')) if _ports | length > 0 else 'none',
+                     _allow_ports | join(', '),
+                     'All open ports are approved' if _bad_ports | length == 0
+                       else ('Not in baseline: ' ~ (_bad_ports | join(', '))))
+         | audit_add('Firewall', 'Firewall services baseline',
+                     'PASS' if _bad_services | length == 0 else 'FAIL',
+                     (_services | join(', ')) if _services | length > 0 else 'none',
+                     _allow_services | join(', '),
+                     'All enabled services are approved' if _bad_services | length == 0
+                       else ('Not in baseline: ' ~ (_bad_services | join(', '))))
+         | audit_add('Firewall', 'Firewall sources and rich rules',
+                     'FAIL' if _bad_sources | length > 0 else ('WARNING' if _rich > 0 else 'PASS'),
+                     'sources: ' ~ ((_sources | join(', ')) if _sources | length > 0 else 'none') ~ '; rich rules: ' ~ _rich,
+                     'sources: ' ~ ((_allow_sources | join(', ')) if _allow_sources | length > 0 else 'none'),
+                     ('Source(s) not in baseline: ' ~ (_bad_sources | join(', '))) if _bad_sources | length > 0
+                       else ('Rich rules exist - review them manually' if _rich > 0 else 'Meets baseline')) }}
+
+# ======================================================================= sudo
+- name: Read sudo configuration
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    visudo -c >/dev/null 2>&1; echo "VISUDO_RC=$?"
+    NP=$(grep -rhE '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d 2>/dev/null | sed 's/[[:space:]]\+/ /g' | sort -u | tr '\n' ';')
+    echo "NOPASSWD=${NP}"
+    echo "WHEEL=$(getent group wheel | cut -d: -f4 | tr ',' ' ')"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_sudo
+  changed_when: false
+  failed_when: false
+
+- name: Record sudo results
+  vars:
+    _kv: "{{ audit_cmd_sudo.stdout | default('') | audit_kv }}"
+    _np: "{{ (_kv.NOPASSWD | default('')).split(';') | map('trim') | reject('equalto', '') | list }}"
+    _ap: "{{ audit.sudo_nopasswd_approved | default([]) }}"
+    _re: "{{ (_ap | map('regex_escape') | join('|')) or '(?!x)x' }}"
+    _bad_np: "{{ _np | reject('search', _re) | list }}"
+    _wheel: "{{ (_kv.WHEEL | default('')).split() }}"
+    _has_wap: "{{ approved_wheel_members is defined }}"
+    _wap: "{{ approved_wheel_members | default([]) }}"
+    _wextra: "{{ (_wheel | difference(_wap) | sort) if (_has_wap | bool) else [] }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Sudo', 'sudoers syntax (visudo -c)',
+                     'PASS' if (_kv.VISUDO_RC | default('1')) == '0' else ('UNKNOWN' if (_kv.VISUDO_RC | default('')) == '127' else 'FAIL'),
+                     'exit code ' ~ (_kv.VISUDO_RC | default('unknown')),
+                     'exit code 0',
+                     'sudoers files parse correctly' if (_kv.VISUDO_RC | default('1')) == '0' else 'visudo reported a problem')
+         | audit_add('Sudo', 'NOPASSWD sudo rules',
+                     'PASS' if _bad_np | length == 0 else 'WARNING',
+                     (_bad_np | join(' ; ')) if _bad_np | length > 0 else 'none outside the approved list',
+                     'no passwordless sudo except: ' ~ ((_ap | join(', ')) if _ap | length > 0 else 'none'),
+                     'No unapproved NOPASSWD rules' if _bad_np | length == 0 else 'Passwordless sudo rule(s) found - confirm they are approved')
+         | audit_add('Sudo', 'Members of group wheel',
+                     'FAIL' if _wextra | length > 0 else 'PASS',
+                     (_wheel | join(', ')) if _wheel | length > 0 else 'no members',
+                     (_wap | join(', ')) if (_has_wap | bool) else 'no approved list defined (inventory only)',
+                     ('Not in approved_wheel_members: ' ~ (_wextra | join(', '))) if _wextra | length > 0
+                       else ('Matches approved list' if (_has_wap | bool) else 'Inventory only - define approved_wheel_members in host_vars to enforce')) }}
+
+# ============================================================ scheduled jobs
+- name: Inventory cron jobs and systemd timers
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    DIRS="/etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly"
+    echo "CRON_FILES=$(find $DIRS -type f 2>/dev/null | wc -l)"
+    echo "USER_CRONTABS=$(ls -1 /var/spool/cron 2>/dev/null | wc -l)"
+    echo "TIMERS=$(systemctl list-timers --all --no-legend --no-pager 2>/dev/null | grep -c '\.timer')"
+    echo "WORLD_WRITABLE=$(find $DIRS /etc/crontab /var/spool/cron -type f -perm -0002 2>/dev/null | tr '\n' ' ')"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_cron
+  changed_when: false
+  failed_when: false
+
+- name: Record scheduled job results
+  vars:
+    _kv: "{{ audit_cmd_cron.stdout | default('') | audit_kv }}"
+    _ww: "{{ _kv.WORLD_WRITABLE | default('') | trim }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Scheduled jobs', 'Cron and systemd timer inventory',
+                     'PASS',
+                     (_kv.CRON_FILES | default('?')) ~ ' cron files, ' ~ (_kv.USER_CRONTABS | default('?')) ~ ' user crontabs, ' ~ (_kv.TIMERS | default('?')) ~ ' systemd timers',
+                     'informational', 'Inventory of scheduled jobs')
+         | audit_add('Scheduled jobs', 'World-writable cron files',
+                     'PASS' if _ww | length == 0 else 'CRITICAL',
+                     _ww if _ww | length > 0 else 'none',
+                     'none',
+                     'No world-writable cron files' if _ww | length == 0 else 'Any user can modify a scheduled job') }}
+
+# ================================================== authentication failures
+- name: Count recent authentication failures
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    SRC=none; DATA=""; N=0; TOP=""
+    if command -v journalctl >/dev/null 2>&1; then
+      J=$(journalctl --no-pager -q --since "24 hours ago" -t sshd -t sudo -t su -t login 2>/dev/null)
+      if [ -n "$J" ] || [ ! -r /var/log/secure ]; then
+        if journalctl -n 1 --no-pager -q >/dev/null 2>&1; then SRC=journal; DATA="$J"; fi
+      fi
+    fi
+    if [ "$SRC" = none ] && [ -r /var/log/secure ]; then SRC=/var/log/secure; DATA=$(cat /var/log/secure); fi
+    if [ "$SRC" != none ]; then
+      FAILS=$(printf '%s\n' "$DATA" | grep -Ei 'Failed password|authentication failure|Invalid user|Failed publickey|maximum authentication attempts')
+      N=$(printf '%s\n' "$FAILS" | grep -c .)
+      TOP=$(printf '%s\n' "$FAILS" | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' | sort | uniq -c | sort -rn | head -3 | awk '{ printf "%s(%s) ", $2, $1 }')
+    fi
+    echo "SOURCE=${SRC}"
+    echo "COUNT=${N}"
+    echo "TOP=${TOP}"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_authfail
+  changed_when: false
+  failed_when: false
+
+- name: Record authentication failure result
+  vars:
+    _kv: "{{ audit_cmd_authfail.stdout | default('') | audit_kv }}"
+    _src: "{{ _kv.SOURCE | default('none') }}"
+    _n: "{{ _kv.COUNT | default('0') | int }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Authentication', 'Failed login attempts (24 h)',
+                     'UNKNOWN' if _src == 'none' else (_n | audit_threshold(audit.auth_failures_warning, audit.auth_failures_critical)),
+                     'no readable log source' if _src == 'none'
+                       else (_n ~ ' failure(s) from ' ~ _src ~ ((' - top sources: ' ~ _kv.TOP) if (_kv.TOP | default('') | trim | length > 0) else '')),
+                     '< ' ~ audit.auth_failures_warning,
+                     'Neither journald nor /var/log/secure could be read' if _src == 'none'
+                       else ('Within threshold' if _n < (audit.auth_failures_warning | int) else 'High number of authentication failures')) }}

@@ -1,0 +1,129 @@
+{%- set r = audit_report_data -%}
+{%- set colors = {'CRITICAL': '#b71c1c', 'FAIL': '#e65100', 'WARNING': '#f9a825', 'UNKNOWN': '#6a1b9a', 'PASS': '#2e7d32', 'NOT_APPLICABLE': '#757575'} -%}
+{%- macro badge(status) -%}<span class="badge s-{{ status | lower }}">{{ status | replace('_', ' ') }}</span>{%- endmacro -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ r.title | e }} - {{ r.generated_utc | e }}</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; margin: 0; color: #212121; background: #f4f6f8; }
+  header { background: #263238; color: #fff; padding: 20px 28px; }
+  header h1 { margin: 0 0 6px 0; font-size: 22px; }
+  header .meta { font-size: 13px; color: #cfd8dc; }
+  main { padding: 20px 28px; max-width: 1500px; margin: 0 auto; }
+  h2 { font-size: 18px; margin: 28px 0 10px 0; border-bottom: 2px solid #cfd8dc; padding-bottom: 4px; }
+  h3 { font-size: 15px; margin: 0; }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; }
+  .card { background: #fff; border-radius: 6px; padding: 12px 18px; min-width: 120px; box-shadow: 0 1px 3px rgba(0,0,0,.15); border-top: 4px solid #90a4ae; }
+  .card .n { font-size: 28px; font-weight: 700; }
+  .card .l { font-size: 12px; text-transform: uppercase; color: #546e7a; }
+  table { border-collapse: collapse; width: 100%; background: #fff; font-size: 13px; }
+  th, td { border: 1px solid #dde3e8; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #eceff1; position: sticky; top: 0; }
+  td.num { text-align: center; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; color: #fff; font-size: 11px; font-weight: 700; white-space: nowrap; }
+  .s-critical { background: {{ colors.CRITICAL }}; }
+  .s-fail { background: {{ colors.FAIL }}; }
+  .s-warning { background: {{ colors.WARNING }}; color: #212121; }
+  .s-unknown { background: {{ colors.UNKNOWN }}; }
+  .s-pass { background: {{ colors.PASS }}; }
+  .s-not_applicable { background: {{ colors.NOT_APPLICABLE }}; }
+  details { background: #fff; border-radius: 6px; margin: 10px 0; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+  summary { cursor: pointer; padding: 10px 14px; display: flex; gap: 12px; align-items: center; }
+  details .body { padding: 0 14px 14px 14px; }
+  .small { color: #546e7a; font-size: 12px; }
+  .banner { padding: 12px 18px; border-radius: 6px; color: #fff; font-weight: 700; margin-bottom: 16px; }
+  footer { margin: 30px 0 10px 0; color: #78909c; font-size: 12px; }
+  label.toggle { font-size: 13px; margin-left: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>{{ r.title | e }}</h1>
+  <div class="meta">Generated {{ r.generated_utc | e }}{% if r.generated_local %} &middot; {{ r.generated_local | e }}{% endif %}
+    &middot; {{ r.summary.hosts_total }} server(s) &middot; {{ r.summary.checks_total }} check results</div>
+</header>
+<main>
+  <div class="banner s-{{ r.summary.overall | lower }}">Overall status: {{ r.summary.overall | replace('_', ' ') }}
+    &mdash; {{ r.summary.hosts_clean }} of {{ r.summary.hosts_total }} server(s) clean{% if r.summary.hosts_without_data %}, {{ r.summary.hosts_without_data }} without audit data{% endif %}</div>
+
+  <div class="cards">
+  {% for s in ['CRITICAL', 'FAIL', 'WARNING', 'UNKNOWN', 'PASS', 'NOT_APPLICABLE'] %}
+    <div class="card" style="border-top-color: {{ colors[s] }}"><div class="n">{{ r.summary.counts[s] }}</div><div class="l">{{ s | replace('_', ' ') }}</div></div>
+  {% endfor %}
+  </div>
+
+  <h2>Server overview</h2>
+  <table>
+    <tr><th>Server</th><th>Address</th><th>OS</th><th>Role</th><th>Status</th>
+        <th>Critical</th><th>Fail</th><th>Warning</th><th>Unknown</th><th>Pass</th><th>N/A</th></tr>
+  {% for h in r.hosts %}
+    <tr>
+      <td><a href="#host-{{ h.anchor | e }}">{{ h.name | e }}</a></td>
+      <td>{{ h.address | e }}</td>
+      <td>{{ h.os | e }}</td>
+      <td>{{ h.roles | e }}</td>
+      <td>{{ badge(h.status) }}</td>
+      <td class="num">{{ h.counts.CRITICAL }}</td><td class="num">{{ h.counts.FAIL }}</td>
+      <td class="num">{{ h.counts.WARNING }}</td><td class="num">{{ h.counts.UNKNOWN }}</td>
+      <td class="num">{{ h.counts.PASS }}</td><td class="num">{{ h.counts.NOT_APPLICABLE }}</td>
+    </tr>
+  {% endfor %}
+  </table>
+
+  <h2>Findings requiring attention ({{ r.attention | length }})</h2>
+  {% if r.attention %}
+  <table>
+    <tr><th>Severity</th><th>Server</th><th>Category</th><th>Check</th><th>Finding</th><th>Actual</th><th>Expected</th></tr>
+  {% for f in r.attention %}
+    <tr>
+      <td>{{ badge(f.status) }}</td>
+      <td><a href="#host-{{ f.anchor | e }}">{{ f.host | e }}</a></td>
+      <td>{{ f.category | e }}</td><td>{{ f.check | e }}</td><td>{{ f.finding | e }}</td>
+      <td>{{ f.actual | e }}</td><td>{{ f.expected | e }}</td>
+    </tr>
+  {% endfor %}
+  </table>
+  {% else %}
+  <p>No CRITICAL, FAIL, WARNING or UNKNOWN findings.</p>
+  {% endif %}
+
+  <h2>Detailed results per server
+    <label class="toggle"><input type="checkbox" id="showpass" checked> show PASS / N/A rows</label></h2>
+  {% for h in r.hosts %}
+  <details id="host-{{ h.anchor | e }}"{% if h.status in ['CRITICAL', 'FAIL', 'WARNING', 'UNKNOWN'] %} open{% endif %}>
+    <summary>{{ badge(h.status) }} <h3>{{ h.name | e }}</h3>
+      <span class="small">{{ h.address | e }} &middot; {{ h.os | e }}{% if h.kernel %} &middot; kernel {{ h.kernel | e }}{% endif %}{% if h.roles %} &middot; {{ h.roles | e }}{% endif %}</span></summary>
+    <div class="body">
+      {% if h.ip_addresses or h.groups %}<p class="small">{% if h.ip_addresses %}IPs: {{ h.ip_addresses | e }}{% endif %}{% if h.groups %} &middot; Groups: {{ h.groups | e }}{% endif %}</p>{% endif %}
+      <table>
+        <tr><th>Status</th><th>Category</th><th>Check</th><th>Actual</th><th>Expected</th><th>Finding</th></tr>
+      {% for x in h.results %}
+        <tr class="row-{{ x.status | lower }}">
+          <td>{{ badge(x.status) }}</td><td>{{ x.category | e }}</td><td>{{ x.check | e }}</td>
+          <td>{{ x.actual | e }}</td><td>{{ x.expected | e }}</td><td>{{ x.finding | e }}</td>
+        </tr>
+      {% endfor %}
+      </table>
+    </div>
+  </details>
+  {% endfor %}
+
+  <footer>
+    Read-only audit generated by Ansible/AWX. Baselines come from group_vars/host_vars and must be approved by the
+    system owner; this report is not a CIS certification. Status meanings: PASS meets the baseline &middot;
+    WARNING needs review &middot; FAIL differs from an approved baseline &middot; CRITICAL urgent problem &middot;
+    NOT APPLICABLE not relevant &middot; UNKNOWN could not be determined.
+  </footer>
+</main>
+<script>
+  var cb = document.getElementById('showpass');
+  if (cb) cb.addEventListener('change', function () {
+    var rows = document.querySelectorAll('tr.row-pass, tr.row-not_applicable');
+    for (var i = 0; i < rows.length; i++) rows[i].style.display = cb.checked ? '' : 'none';
+  });
+</script>
+</body>
+</html>

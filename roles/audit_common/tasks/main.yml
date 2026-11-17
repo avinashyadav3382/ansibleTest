@@ -1,0 +1,131 @@
+---
+# audit_common - collects the facts used by the other roles and records the
+# checks that apply to every server (RHEL release, package repositories).
+# READ ONLY: only commands that inspect state are used.
+
+- name: Initialise the result list
+  ansible.builtin.set_fact:
+    audit_results: []
+    audit_common_done: false
+
+- name: Read the current epoch time on the target
+  ansible.builtin.command: date +%s
+  register: audit_cmd_epoch
+  changed_when: false
+  failed_when: false
+
+- name: Read /etc/redhat-release
+  ansible.builtin.command: cat /etc/redhat-release
+  register: audit_cmd_release
+  changed_when: false
+  failed_when: false
+
+- name: Collect running systemd services
+  ansible.builtin.shell: |
+    {% raw %}
+    systemctl list-units --type=service --state=running --no-legend --no-pager --plain 2>/dev/null \
+      | awk '{ n = $1; sub(/\.service$/, "", n); print n }'
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_services
+  changed_when: false
+  failed_when: false
+
+- name: Collect listening sockets
+  ansible.builtin.shell: |
+    {% raw %}
+    # Output: port/proto|address|process|scope   (scope = local for loopback, ext otherwise)
+    ss -H -tulnp 2>/dev/null | awk '
+      {
+        proto = $1; local = $5
+        n = match(local, /:[^:]*$/)
+        addr = substr(local, 1, n - 1); port = substr(local, n + 1)
+        proc = ""
+        if (match($0, /\(\("[^"]+"/)) proc = substr($0, RSTART + 3, RLENGTH - 4)
+        sub(/%[^:]*$/, "", addr)
+        scope = "ext"
+        if (addr ~ /^127\./ || addr == "[::1]" || addr == "::1") scope = "local"
+        print port "/" proto "|" addr "|" proc "|" scope
+      }'
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_sockets
+  changed_when: false
+  failed_when: false
+
+- name: Collect enabled package repositories
+  ansible.builtin.shell: |
+    {% raw %}
+    out=$(timeout 120 dnf -q repolist --enabled 2>/dev/null); rc=$?
+    echo "RC=${rc}"
+    printf '%s\n' "$out" | awk 'NR > 1 && NF { r = r $1 " "; n++ } END { print "COUNT=" n + 0; print "REPOS=" r }'
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_repos
+  changed_when: false
+  failed_when: false
+
+- name: Build host information and shared facts
+  ansible.builtin.set_fact:
+    audit_now_epoch: "{{ audit_cmd_epoch.stdout | default('0') | trim | int }}"
+    audit_running_services: "{{ audit_cmd_services.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+    audit_listening_raw: "{{ audit_cmd_sockets.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+    audit_repo_info: "{{ audit_cmd_repos.stdout | default('') | audit_kv }}"
+    audit_allowed_services: >-
+      {{ (audit.common_allowed_services | default([]))
+         | union((expected_services | default({})).allowed | default([]))
+         | unique | list }}
+    audit_required_services: >-
+      {{ ((expected_services | default({})).required
+          | default((expected_services | default({})).allowed | default([])))
+         | union(audit.common_required_services | default([]))
+         | unique | list }}
+    audit_approved_ports: >-
+      {{ (audit.common_expected_ports | default([]))
+         | union(expected_ports | default([]))
+         | unique | list }}
+    audit_host_info:
+      hostname: "{{ ansible_facts.hostname | default(inventory_hostname) }}"
+      fqdn: "{{ ansible_facts.fqdn | default('') }}"
+      address: "{{ ansible_host | default(inventory_hostname) }}"
+      ip_addresses: "{{ ansible_facts.all_ipv4_addresses | default([]) | join(', ') }}"
+      os: "{{ (audit_cmd_release.stdout | default('') | trim) or ((ansible_facts.distribution | default('unknown')) ~ ' ' ~ (ansible_facts.distribution_version | default(''))) }}"
+      kernel: "{{ ansible_facts.kernel | default('') }}"
+      roles: "{{ server_role | default([]) | join(', ') }}"
+      groups: "{{ group_names | join(', ') }}"
+
+- name: Record RHEL release and repository results
+  vars:
+    _major: "{{ ansible_facts.distribution_major_version | default('0') | string }}"
+    _dist: "{{ ansible_facts.distribution | default('unknown') }}"
+    _ver: "{{ ansible_facts.distribution_version | default('?') }}"
+    _expected_major: "{{ audit_rhel_expected_major | default(_major) | string }}"
+    _supported: "{{ _major in ['8', '9', '10'] }}"
+    _group_ok: "{{ _major == _expected_major }}"
+    _repo_rc: "{{ audit_repo_info.RC | default('1') }}"
+    _repo_count: "{{ audit_repo_info.COUNT | default('0') | int }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('System', 'RHEL version',
+                     'FAIL' if not (_supported | bool)
+                       else ('WARNING' if (_dist != 'RedHat' or not (_group_ok | bool)) else 'PASS'),
+                     audit_host_info.os ~ ' (' ~ _dist ~ ' ' ~ _ver ~ ')',
+                     'RHEL 8, 9 or 10 matching the inventory group (' ~ _expected_major ~ ')',
+                     'Unsupported major version' if not (_supported | bool)
+                       else ('Not Red Hat Enterprise Linux' if _dist != 'RedHat'
+                       else ('Inventory group RHEL' ~ _expected_major ~ ' does not match the real major version ' ~ _major
+                             if not (_group_ok | bool) else 'Supported release')))
+         | audit_add('System', 'Package repositories',
+                     'UNKNOWN' if _repo_rc != '0' else ('PASS' if _repo_count > 0 else 'FAIL'),
+                     (audit_repo_info.REPOS | default('')) if _repo_rc == '0' else 'dnf repolist failed',
+                     'At least one enabled repository',
+                     'dnf could not list repositories' if _repo_rc != '0'
+                       else (_repo_count ~ ' enabled repositories' if _repo_count > 0 else 'No enabled repositories - patching is not possible')) }}
+
+- name: Mark audit_common as complete
+  ansible.builtin.set_fact:
+    audit_common_done: true

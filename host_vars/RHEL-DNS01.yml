@@ -1,0 +1,24 @@
+---
+server_role:
+  - dns
+
+expected_services:
+  allowed:
+    - sshd
+    - chronyd
+    - firewalld
+    - named
+
+expected_ports:
+  - 22/tcp
+  - 53/tcp
+  - 53/udp
+
+directory_checks:
+  - path: /var/log
+    warning: 70
+    critical: 85
+
+  - path: /var/named
+    warning: 80
+    critical: 90

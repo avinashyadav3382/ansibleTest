@@ -1,0 +1,8 @@
+---
+# Collections used by the project.
+# NOTE: AWX only auto-installs collections from collections/requirements.yml.
+# For an intranet/air-gapped AWX, bake these into the execution environment
+# (see execution-environment/) instead of downloading them at project sync.
+collections:
+  - name: ansible.posix
+  - name: community.general   # provides community.general.mail

@@ -1,0 +1,429 @@
+---
+# audit_system - filesystems, directories, services, performance, time, network,
+# patching and reboot state. READ ONLY.
+# Note: `dnf check-update` may refresh the local dnf metadata cache; it never
+# installs, removes or updates anything.
+
+# ================================================================ filesystems
+- name: Read filesystem usage
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    EXCL=""
+    for t in $AUDIT_DF_EXCLUDE; do EXCL="$EXCL -x $t"; done
+    # Output: mountpoint|fstype|used-percent|device
+    timeout 60 df -PT $EXCL 2>/dev/null | awk 'NR > 1 {
+      pct = $6; sub(/%/, "", pct); mp = $7
+      for (i = 8; i <= NF; i++) mp = mp " " $i
+      print mp "|" $2 "|" pct "|" $1 }'
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  environment:
+    AUDIT_DF_EXCLUDE: "{{ audit.df_exclude_types | default([]) | join(' ') }}"
+  register: audit_cmd_df
+  changed_when: false
+  failed_when: false
+
+- name: Record filesystem usage results
+  vars:
+    _f: "{{ item.split('|') }}"
+    _mp: "{{ _f[0] }}"
+    _pct: "{{ _f[2] | default('0') | int }}"
+    _th: "{{ (filesystem_thresholds | default({}))[_mp] | default({}) }}"
+    _warn: "{{ _th.warning | default(audit.disk_default_warning) }}"
+    _crit: "{{ _th.critical | default(audit.disk_default_critical) }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Disk', 'Filesystem usage ' ~ _mp,
+                     _pct | audit_threshold(_warn, _crit),
+                     _pct ~ '% used (' ~ _f[1] ~ ', ' ~ (_f[3] | default('')) ~ ')',
+                     '< ' ~ _warn ~ '% (critical at ' ~ _crit ~ '%)',
+                     'Within threshold' if (_pct | int) < (_warn | int)
+                       else ('Above the warning threshold' if (_pct | int) < (_crit | int) else 'Above the critical threshold')) }}
+  loop: "{{ audit_cmd_df.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+  loop_control:
+    label: "{{ item.split('|')[0] }}"
+
+- name: Record the case of no filesystem data
+  when: (audit_cmd_df.stdout_lines | default([]) | length) == 0
+  ansible.builtin.set_fact:
+    audit_results: "{{ audit_results | audit_add('Disk', 'Filesystem usage', 'UNKNOWN', 'df returned no data', 'df succeeds', 'Could not read filesystem usage') }}"
+
+- name: Read inode usage and read-only filesystems
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    EXCL=""
+    for t in $AUDIT_DF_EXCLUDE; do EXCL="$EXCL -x $t"; done
+    timeout 60 df -Pi $EXCL 2>/dev/null | awk -v w="$INODE_WARN" -v c="$INODE_CRIT" '
+      NR > 1 {
+        pct = $5; sub(/%/, "", pct)
+        if (pct == "-") next
+        if (pct + 0 >= c + 0) crit = crit $6 "(" pct "%) "
+        else if (pct + 0 >= w + 0) warn = warn $6 "(" pct "%) "
+      }
+      END { print "INODE_CRIT=" crit; print "INODE_WARN=" warn }'
+    echo "READONLY=$(awk '$3 ~ /^(xfs|ext[234]|btrfs)$/ && $4 ~ /(^|,)ro(,|$)/ { print $2 }' /proc/mounts | sort -u | tr '\n' ' ')"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  environment:
+    AUDIT_DF_EXCLUDE: "{{ audit.df_exclude_types | default([]) | join(' ') }}"
+    INODE_WARN: "{{ audit.inode_warning | default(80) }}"
+    INODE_CRIT: "{{ audit.inode_critical | default(90) }}"
+  register: audit_cmd_inodes
+  changed_when: false
+  failed_when: false
+
+- name: Record inode and read-only filesystem results
+  vars:
+    _kv: "{{ audit_cmd_inodes.stdout | default('') | audit_kv }}"
+    _ic: "{{ _kv.INODE_CRIT | default('') | trim }}"
+    _iw: "{{ _kv.INODE_WARN | default('') | trim }}"
+    _ro: "{{ _kv.READONLY | default('') | trim }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Disk', 'Inode usage',
+                     'UNKNOWN' if _kv.INODE_CRIT is not defined else ('CRITICAL' if _ic | length > 0 else ('WARNING' if _iw | length > 0 else 'PASS')),
+                     (_ic ~ ' ' ~ _iw) | trim if ((_ic ~ _iw) | length > 0) else 'all filesystems below threshold',
+                     '< ' ~ audit.inode_warning | default(80) ~ '%',
+                     'Could not read inode usage' if _kv.INODE_CRIT is not defined
+                       else ('Inode exhaustion risk' if (_ic ~ _iw) | length > 0 else 'Within threshold'))
+         | audit_add('Disk', 'Read-only filesystems',
+                     'UNKNOWN' if _kv.READONLY is not defined else ('PASS' if _ro | length == 0 else 'CRITICAL'),
+                     _ro if _ro | length > 0 else 'none',
+                     'none',
+                     'No read-only data filesystems' if _ro | length == 0 else 'Filesystem remounted read-only (possible I/O errors)') }}
+
+# ================================================================ directories
+- name: Inspect configured directories
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    if [ ! -e "$DIR_PATH" ]; then echo "EXISTS=no"; exit 0; fi
+    echo "EXISTS=yes"
+    echo "FS=$(timeout 60 df -P "$DIR_PATH" 2>/dev/null | awk 'NR == 2 { pct = $5; sub(/%/, "", pct); print pct "|" $6 "|" $1 }')"
+    if [ "$DIR_SIZE" = "yes" ]; then
+      echo "SIZEMB=$(timeout 120 du -sxm "$DIR_PATH" 2>/dev/null | awk '{ print $1 }')"
+    fi
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  environment:
+    DIR_PATH: "{{ item.path }}"
+    DIR_SIZE: "{{ 'yes' if (item.include_size | default(false) | bool) else 'no' }}"
+  loop: "{{ directory_checks | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: audit_cmd_dirs
+  changed_when: false
+  failed_when: false
+
+- name: Record directory usage results
+  vars:
+    _d: "{{ item.item }}"
+    _kv: "{{ item.stdout | default('') | audit_kv }}"
+    _fs: "{{ (_kv.FS | default('')).split('|') }}"
+    _pct: "{{ _fs[0] | default('') }}"
+    _warn: "{{ _d.warning | default(audit.directory_default_warning) }}"
+    _crit: "{{ _d.critical | default(audit.directory_default_critical) }}"
+    _exists: "{{ (_kv.EXISTS | default('')) == 'yes' }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Disk', 'Directory usage ' ~ _d.path,
+                     ('NOT_APPLICABLE' if (_d.optional | default(false) | bool) else 'FAIL') if not (_exists | bool)
+                       else (_pct | audit_threshold(_warn, _crit) if (_pct | length > 0) else 'UNKNOWN'),
+                     'path does not exist' if not (_exists | bool)
+                       else (('filesystem ' ~ (_fs[2] | default('?')) ~ ' mounted on ' ~ (_fs[1] | default('?')) ~ ': ' ~ _pct ~ '% used'
+                              ~ ((', directory size ' ~ _kv.SIZEMB ~ ' MB') if (_kv.SIZEMB | default('') | length > 0) else ''))
+                             if (_pct | length > 0) else 'df failed'),
+                     '< ' ~ _warn ~ '% (critical at ' ~ _crit ~ '%) of the containing filesystem',
+                     ('Optional directory is absent' if (_d.optional | default(false) | bool) else 'Configured directory is missing') if not (_exists | bool)
+                       else ('Could not determine usage' if _pct | length == 0
+                       else ('Within threshold' if (_pct | int) < (_warn | int)
+                       else ('Above the warning threshold' if (_pct | int) < (_crit | int) else 'Above the critical threshold')))) }}
+  loop: "{{ audit_cmd_dirs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.path | default('') }}"
+
+# ================================================================== services
+- name: Read failed systemd units
+  ansible.builtin.shell: |
+    {% raw %}
+    echo "FAILED=$(systemctl --failed --no-legend --no-pager --plain 2>/dev/null | awk '{ n = $1; sub(/\.service$/, "", n); printf "%s ", n }')"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_failed
+  changed_when: false
+  failed_when: false
+
+- name: Record failed service result
+  vars:
+    _kv: "{{ audit_cmd_failed.stdout | default('') | audit_kv }}"
+    _failed: "{{ (_kv.FAILED | default('')).split() }}"
+    _crit: "{{ _failed | intersect(audit_required_services) }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Services', 'Failed systemd units',
+                     'UNKNOWN' if _kv.FAILED is not defined
+                       else ('PASS' if _failed | length == 0 else ('CRITICAL' if _crit | length > 0 else 'WARNING')),
+                     (_failed | join(', ')) if _failed | length > 0 else 'none',
+                     'none',
+                     'Could not query systemd' if _kv.FAILED is not defined
+                       else ('No failed units' if _failed | length == 0
+                       else ('A required service has failed: ' ~ (_crit | join(', ')) if _crit | length > 0 else 'Failed unit(s) need review'))) }}
+
+# ================================================= uptime, load, memory, swap
+- name: Read uptime, load and memory
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    echo "UPTIME=$(awk '{ print int($1) }' /proc/uptime)"
+    echo "LOAD=$(awk '{ print $1 "|" $2 "|" $3 }' /proc/loadavg)"
+    echo "CPUS=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo)"
+    awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } /^SwapTotal:/ { st = $2 } /^SwapFree:/ { sf = $2 }
+         END { printf "MEM=%d|%d\nSWAP=%d|%d\n", t, a, st, sf }' /proc/meminfo
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_perf
+  changed_when: false
+  failed_when: false
+
+- name: Record uptime, load, memory and swap results
+  vars:
+    _kv: "{{ audit_cmd_perf.stdout | default('') | audit_kv }}"
+    _up_days: "{{ ((_kv.UPTIME | default('0') | int) / 86400) | round(1) }}"
+    _load: "{{ (_kv.LOAD | default('0|0|0')).split('|') }}"
+    _cpus: "{{ [(_kv.CPUS | default('1') | int), 1] | max }}"
+    _per_cpu: "{{ ((_load[2] | default('0') | float) / (_cpus | int)) | round(2) }}"
+    _mem: "{{ (_kv.MEM | default('0|0')).split('|') }}"
+    _mt: "{{ _mem[0] | int }}"
+    _ma: "{{ _mem[1] | default('0') | int }}"
+    _mem_pct: "{{ ((100.0 * ((_mt | int) - (_ma | int))) / (_mt | int)) | round(1) if (_mt | int) > 0 else 0 }}"
+    _swap: "{{ (_kv.SWAP | default('0|0')).split('|') }}"
+    _st: "{{ _swap[0] | int }}"
+    _sf: "{{ _swap[1] | default('0') | int }}"
+    _swap_pct: "{{ ((100.0 * ((_st | int) - (_sf | int))) / (_st | int)) | round(1) if (_st | int) > 0 else 0 }}"
+    _have: "{{ _kv.UPTIME is defined }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Performance', 'Uptime',
+                     'UNKNOWN' if not (_have | bool) else ('WARNING' if (_up_days | float) > (audit.uptime_warning_days | float) else 'PASS'),
+                     _up_days ~ ' days',
+                     '< ' ~ audit.uptime_warning_days ~ ' days',
+                     'Within threshold' if (_up_days | float) <= (audit.uptime_warning_days | float) else 'Long uptime - kernel and library updates may not be active')
+         | audit_add('Performance', 'Load average',
+                     'UNKNOWN' if not (_have | bool) else (_per_cpu | audit_threshold(audit.load_warning_per_cpu, audit.load_critical_per_cpu)),
+                     (_load | join(' / ')) ~ ' on ' ~ _cpus ~ ' CPU(s); 15-min per CPU ' ~ _per_cpu,
+                     '15-min load per CPU < ' ~ audit.load_warning_per_cpu,
+                     'Load per CPU: ' ~ _per_cpu)
+         | audit_add('Performance', 'Memory usage',
+                     'UNKNOWN' if (_mt | int) == 0 else (_mem_pct | audit_threshold(audit.memory_warning_pct, audit.memory_critical_pct)),
+                     _mem_pct ~ '% used of ' ~ ((_mt | int) // 1024) ~ ' MB (MemAvailable based)',
+                     '< ' ~ audit.memory_warning_pct ~ '%',
+                     'Memory used excluding reclaimable cache')
+         | audit_add('Performance', 'Swap usage',
+                     'NOT_APPLICABLE' if (_st | int) == 0 else (_swap_pct | audit_threshold(audit.swap_warning_pct, audit.swap_critical_pct)),
+                     'no swap configured' if (_st | int) == 0 else (_swap_pct ~ '% of ' ~ ((_st | int) // 1024) ~ ' MB'),
+                     '< ' ~ audit.swap_warning_pct ~ '%',
+                     'No swap configured' if (_st | int) == 0 else 'Swap in use') }}
+
+# ================================================================ time (chrony)
+- name: Read chrony state
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    echo "ACTIVE=$(systemctl is-active chronyd 2>/dev/null)"
+    echo "ENABLED=$(systemctl is-enabled chronyd 2>/dev/null)"
+    if command -v chronyc >/dev/null 2>&1; then
+      timeout 20 chronyc tracking 2>/dev/null | awk -F': *' '
+        /^Leap status/ { leap = $2 }
+        /^System time/ { split($2, a, " "); off = a[1] }
+        END { print "LEAP=" leap; print "OFFSET=" off }'
+      echo "SOURCES=$(timeout 20 chronyc -n sources 2>/dev/null | grep -c '^\^[*+]')"
+    fi
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_chrony
+  changed_when: false
+  failed_when: false
+
+- name: Record time synchronisation results
+  vars:
+    _kv: "{{ audit_cmd_chrony.stdout | default('') | audit_kv }}"
+    _active: "{{ _kv.ACTIVE | default('unknown') }}"
+    _leap: "{{ _kv.LEAP | default('') }}"
+    _off: "{{ (_kv.OFFSET | default('')) }}"
+    _have_off: "{{ (_off | length > 0) and (_off | regex_search('^[0-9.eE+-]+$') is not none) }}"
+    _offabs: "{{ (_off | float) | abs if (_have_off | bool) else 0 }}"
+    _status: >-
+      {{ 'UNKNOWN' if not (_have_off | bool)
+         else ('FAIL' if (_leap | lower) == 'not synchronised' or (_offabs | float) >= (audit.ntp_offset_critical_seconds | float)
+         else ('WARNING' if (_offabs | float) >= (audit.ntp_offset_warning_seconds | float) else 'PASS')) }}
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Time', 'chronyd service',
+                     'PASS' if _active == 'active' else 'FAIL',
+                     _active ~ ', ' ~ (_kv.ENABLED | default('enablement unknown')),
+                     'active',
+                     'chronyd is running' if _active == 'active' else 'chronyd is not running')
+         | audit_add('Time', 'Time synchronisation',
+                     _status,
+                     ('leap status ' ~ _leap ~ ', offset ' ~ (_offabs | float | round(6)) ~ ' s, sources selected: ' ~ (_kv.SOURCES | default('?')))
+                       if (_have_off | bool) else 'chronyc tracking unavailable',
+                     'Normal and offset < ' ~ audit.ntp_offset_warning_seconds ~ ' s',
+                     'Could not read chrony tracking data' if not (_have_off | bool)
+                       else ('Clock is not synchronised' if (_leap | lower) == 'not synchronised' else 'Offset measured by chronyc tracking')) }}
+
+# ==================================================================== network
+- name: Read network basics
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    echo "DEFROUTE=$(ip -o route show default 2>/dev/null | head -1 | awk '{ print $3 " via " $5 }')"
+    echo "DNS=$(awk '/^nameserver/ { printf "%s ", $2 }' /etc/resolv.conf 2>/dev/null)"
+    if [ -n "$DNS_TEST" ]; then
+      if getent hosts "$DNS_TEST" >/dev/null 2>&1; then echo "DNSTEST=ok"; else echo "DNSTEST=failed"; fi
+    fi
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  environment:
+    DNS_TEST: "{{ audit.dns_test_name | default('') }}"
+  register: audit_cmd_net
+  changed_when: false
+  failed_when: false
+
+- name: Record network results
+  vars:
+    _kv: "{{ audit_cmd_net.stdout | default('') | audit_kv }}"
+    _route: "{{ _kv.DEFROUTE | default('') }}"
+    _dns: "{{ _kv.DNS | default('') | trim }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Network', 'Default route',
+                     'PASS' if _route | length > 0 else 'FAIL',
+                     _route if _route | length > 0 else 'none',
+                     'a default route exists',
+                     'Default gateway present' if _route | length > 0 else 'No default route')
+         | audit_add('Network', 'DNS resolvers',
+                     'PASS' if _dns | length > 0 else 'FAIL',
+                     _dns if _dns | length > 0 else 'none in /etc/resolv.conf',
+                     'at least one nameserver',
+                     'Resolvers configured' if _dns | length > 0 else 'No nameserver configured')
+         | audit_add('Network', 'DNS lookup test (' ~ (audit.dns_test_name | default('')) ~ ')',
+                     'NOT_APPLICABLE' if (audit.dns_test_name | default('')) | length == 0
+                       else ('PASS' if (_kv.DNSTEST | default('')) == 'ok' else 'FAIL'),
+                     'not configured' if (audit.dns_test_name | default('')) | length == 0 else (_kv.DNSTEST | default('unknown')),
+                     'name resolves',
+                     'Set audit.dns_test_name to enable' if (audit.dns_test_name | default('')) | length == 0
+                       else ('Resolution works' if (_kv.DNSTEST | default('')) == 'ok' else 'Name resolution failed')) }}
+
+# ==================================================================== updates
+- name: Read available updates
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    T=${DNF_TIMEOUT:-300}
+    out=$(timeout "$T" dnf -q check-update 2>/dev/null); rc=$?
+    echo "CHECK_RC=${rc}"
+    echo "TOTAL=$(printf '%s\n' "$out" | awk '/^$/ { exit } NF == 3 { n++ } END { print n + 0 }')"
+    sec=$(timeout "$T" dnf -q updateinfo list --security 2>/dev/null); src=$?
+    echo "SEC_RC=${src}"
+    echo "SEC_TOTAL=$(printf '%s\n' "$sec" | awk '$1 ~ /^[A-Z]+-[0-9]+:[0-9]+$/ { print $1 }' | sort -u | wc -l)"
+    echo "SEC_CRITICAL=$(printf '%s\n' "$sec" | awk '$1 ~ /^[A-Z]+-[0-9]+:[0-9]+$/ && $2 ~ /^Critical/ { print $1 }' | sort -u | wc -l)"
+    echo "SEC_IMPORTANT=$(printf '%s\n' "$sec" | awk '$1 ~ /^[A-Z]+-[0-9]+:[0-9]+$/ && $2 ~ /^Important/ { print $1 }' | sort -u | wc -l)"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  environment:
+    DNF_TIMEOUT: "{{ audit.dnf_timeout_seconds | default(300) }}"
+  register: audit_cmd_updates
+  changed_when: false
+  failed_when: false
+
+- name: Record update results
+  vars:
+    _kv: "{{ audit_cmd_updates.stdout | default('') | audit_kv }}"
+    _rc: "{{ _kv.CHECK_RC | default('1') }}"
+    _total: "{{ _kv.TOTAL | default('0') | int }}"
+    _src: "{{ _kv.SEC_RC | default('1') }}"
+    _sec: "{{ _kv.SEC_TOTAL | default('0') | int }}"
+    _seccrit: "{{ _kv.SEC_CRITICAL | default('0') | int }}"
+    _secimp: "{{ _kv.SEC_IMPORTANT | default('0') | int }}"
+    _total_ok: "{{ _rc in ['0', '100'] }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Updates', 'Available package updates',
+                     'UNKNOWN' if not (_total_ok | bool)
+                       else ('WARNING' if _total >= (audit.updates_total_warning | int) else 'PASS'),
+                     (_total ~ ' package update(s) available') if (_total_ok | bool) else 'dnf check-update failed (exit ' ~ _rc ~ ')',
+                     '< ' ~ audit.updates_total_warning,
+                     'Repositories unreachable or dnf failed' if not (_total_ok | bool)
+                       else ('Below threshold' if _total < (audit.updates_total_warning | int) else 'Large update backlog'))
+         | audit_add('Updates', 'Security advisories pending',
+                     'UNKNOWN' if _src != '0'
+                       else ('CRITICAL' if _seccrit > 0 else ('WARNING' if _sec > 0 else 'PASS')),
+                     (_sec ~ ' advisory(ies): ' ~ _seccrit ~ ' critical, ' ~ _secimp ~ ' important') if _src == '0' else 'dnf updateinfo failed (exit ' ~ _src ~ ')',
+                     '0 pending',
+                     'Security metadata unavailable (repositories without updateinfo?)' if _src != '0'
+                       else ('Critical security update(s) pending' if _seccrit > 0 else ('Security update(s) pending' if _sec > 0 else 'System is current for security advisories'))) }}
+
+# ============================================================= reboot, kernel
+- name: Read reboot requirement and kernel inventory
+  ansible.builtin.shell: |
+    {% raw %}
+    set +e
+    if command -v needs-restarting >/dev/null 2>&1; then
+      needs-restarting -r >/dev/null 2>&1; echo "RC=$?"
+    else
+      echo "RC=127"
+    fi
+    echo "RUNNING=$(uname -r)"
+    INST=$(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | grep -v 'not installed' | sort -V)
+    if [ -z "$INST" ]; then
+      INST=$(rpm -q kernel --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | grep -v 'not installed' | sort -V)
+    fi
+    echo "LATEST=$(printf '%s\n' "$INST" | tail -1)"
+    echo "INSTALLED=$(printf '%s\n' "$INST" | tr '\n' ' ')"
+    {% endraw %}
+  args:
+    executable: /bin/bash
+  register: audit_cmd_reboot
+  changed_when: false
+  failed_when: false
+
+- name: Record reboot and kernel results
+  vars:
+    _kv: "{{ audit_cmd_reboot.stdout | default('') | audit_kv }}"
+    _rc: "{{ _kv.RC | default('127') }}"
+    _run: "{{ _kv.RUNNING | default('') }}"
+    _latest: "{{ _kv.LATEST | default('') }}"
+  ansible.builtin.set_fact:
+    audit_results: >-
+      {{ audit_results
+         | audit_add('Updates', 'Reboot required',
+                     'PASS' if _rc == '0' else ('WARNING' if _rc == '1' else 'UNKNOWN'),
+                     'no reboot required' if _rc == '0' else ('reboot required' if _rc == '1' else 'needs-restarting unavailable'),
+                     'no reboot pending',
+                     'Core libraries and kernel are current' if _rc == '0'
+                       else ('Updated core packages are not active until reboot' if _rc == '1'
+                       else (audit_needs_restarting_hint | default('needs-restarting is not installed'))))
+         | audit_add('Updates', 'Kernel inventory',
+                     'UNKNOWN' if _latest | length == 0 else ('PASS' if _run == _latest else 'WARNING'),
+                     'running ' ~ _run ~ '; installed: ' ~ (_kv.INSTALLED | default('')),
+                     'running kernel equals newest installed kernel',
+                     'Could not read the installed kernels' if _latest | length == 0
+                       else ('Running the newest installed kernel' if _run == _latest else 'A newer kernel (' ~ _latest ~ ') is installed but not running')) }}

@@ -1,0 +1,8 @@
+{%- macro q(v) -%}
+{%- set s = v | string -%}
+"{{ ("'" ~ s if s[:1] in ['=', '+', '-', '@'] else s) | replace('"', '""') }}"
+{%- endmacro -%}
+server,address,status,category,check,actual,expected,finding
+{% for f in audit_report_data.findings %}
+{{ q(f.host) }},{{ q(f.address) }},{{ q(f.status) }},{{ q(f.category) }},{{ q(f.check) }},{{ q(f.actual) }},{{ q(f.expected) }},{{ q(f.finding) }}
+{% endfor %}

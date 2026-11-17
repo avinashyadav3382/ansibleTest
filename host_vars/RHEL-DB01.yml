@@ -1,0 +1,40 @@
+---
+server_role:
+  - database
+
+expected_services:
+  allowed:
+    - sshd
+    - chronyd
+    - firewalld
+    - mysqld
+
+expected_ports:
+  - 22/tcp
+  - 3306/tcp
+
+directory_checks:
+  - path: /var/log
+    warning: 70
+    critical: 85
+
+  - path: /var/lib/mysql
+    warning: 80
+    critical: 90
+
+  - path: /backup/mysql
+    warning: 70
+    critical: 85
+
+backup_checks:
+  enabled: true
+  name: MySQL Backup
+  path: /backup/mysql
+  pattern: "*.sql.gz"
+  max_age_hours: 24
+  minimum_size_mb: 10
+
+database_checks:
+  enabled: true
+  service: mysqld
+  port: 3306

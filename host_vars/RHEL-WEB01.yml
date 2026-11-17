@@ -1,0 +1,30 @@
+---
+server_role:
+  - web
+
+expected_services:
+  allowed:
+    - sshd
+    - chronyd
+    - firewalld
+    - nginx
+
+expected_ports:
+  - 22/tcp
+  - 443/tcp
+
+directory_checks:
+  - path: /var/log
+    warning: 70
+    critical: 85
+
+  - path: /var/www
+    warning: 80
+    critical: 90
+
+certificate_checks:
+  enabled: true
+  certificates:
+    - name: Web certificate
+      path: /etc/pki/tls/certs/server.crt
+      warning_days: 30

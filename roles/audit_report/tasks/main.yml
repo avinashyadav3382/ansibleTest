@@ -1,0 +1,150 @@
+---
+# audit_report - runs on the controller (localhost).
+# Aggregates every host's audit_results, writes HTML + CSV + JSON, archives them
+# (optional), and e-mails the report using the SMTP credential injected by AWX.
+
+- name: Determine the hosts included in this report
+  ansible.builtin.set_fact:
+    audit_report_hosts: >-
+      {{ hostvars['localhost']['audit_target_hosts']
+         | default(groups['all'] | difference(['localhost'])) }}
+
+- name: Get the report time in the configured time zone
+  ansible.builtin.command: date '+%Y-%m-%d %H:%M:%S %Z'
+  environment:
+    TZ: "{{ audit.report_timezone | default('UTC') }}"
+  register: audit_report_local_time
+  changed_when: false
+  failed_when: false
+
+- name: Set report timestamps
+  ansible.builtin.set_fact:
+    audit_report_stamp: "{{ now(utc=true).strftime('%Y%m%d-%H%M%S') }}"
+    audit_report_date: "{{ now(utc=true).strftime('%Y-%m-%d') }}"
+    audit_report_generated_utc: "{{ now(utc=true).strftime('%Y-%m-%d %H:%M:%S UTC') }}"
+    audit_report_generated_local: "{{ audit_report_local_time.stdout | default('') | trim }}"
+
+- name: Aggregate the results of every host
+  ansible.builtin.set_fact:
+    audit_report_data: >-
+      {{ hostvars | audit_build_report(audit_report_hosts, audit.report_title,
+                                       audit_report_generated_utc, audit_report_generated_local) }}
+  no_log: "{{ not (audit.debug | default(false) | bool) }}"
+
+- name: Define report file names
+  ansible.builtin.set_fact:
+    audit_report_files:
+      html: "{{ audit.report_dir }}/rhel-audit-{{ audit_report_stamp }}.html"
+      csv: "{{ audit.report_dir }}/rhel-audit-{{ audit_report_stamp }}.csv"
+      json: "{{ audit.report_dir }}/rhel-audit-{{ audit_report_stamp }}.json"
+    audit_report_subject: >-
+      {{ mail.subject_prefix | default(audit.report_title) }} - {{ audit_report_date }} - {{ audit_report_data.summary.overall }}
+      ({{ audit_report_data.summary.counts.CRITICAL }} critical, {{ audit_report_data.summary.counts.FAIL }} fail,
+      {{ audit_report_data.summary.counts.WARNING }} warning, {{ audit_report_data.summary.counts.UNKNOWN }} unknown)
+
+- name: Create the report directory
+  ansible.builtin.file:
+    path: "{{ audit.report_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Write the HTML report
+  ansible.builtin.template:
+    src: report.html.j2
+    dest: "{{ audit_report_files.html }}"
+    mode: "0640"
+
+- name: Write the CSV report
+  ansible.builtin.template:
+    src: report.csv.j2
+    dest: "{{ audit_report_files.csv }}"
+    mode: "0640"
+
+- name: Write the JSON report
+  ansible.builtin.copy:
+    content: "{{ audit_report_data | to_nice_json }}\n"
+    dest: "{{ audit_report_files.json }}"
+    mode: "0640"
+
+- name: Archive report copies (optional persistent storage)
+  when: (audit.history_dir | default('')) | length > 0
+  block:
+    - name: Create the dated archive directory
+      ansible.builtin.file:
+        path: "{{ audit.history_dir }}/{{ audit_report_date }}"
+        state: directory
+        mode: "0750"
+
+    - name: Copy the reports to the archive
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ audit.history_dir }}/{{ audit_report_date }}/{{ item | basename }}"
+        remote_src: true
+        mode: "0640"
+      loop: "{{ audit_report_files.values() | list }}"
+
+- name: Publish the summary as AWX job artifacts
+  ansible.builtin.set_stats:
+    data:
+      rhel_audit_overall_status: "{{ audit_report_data.summary.overall }}"
+      rhel_audit_counts: "{{ audit_report_data.summary.counts }}"
+      rhel_audit_hosts: "{{ audit_report_data.summary.hosts_total }}"
+
+- name: Show the audit summary
+  ansible.builtin.debug:
+    msg:
+      - "Overall status   : {{ audit_report_data.summary.overall }}"
+      - "Servers          : {{ audit_report_data.summary.hosts_total }} ({{ audit_report_data.summary.hosts_without_data }} without data)"
+      - "Findings         : {{ audit_report_data.summary.counts }}"
+      - "HTML report      : {{ audit_report_files.html }}"
+      - "CSV report       : {{ audit_report_files.csv }}"
+      - "JSON report      : {{ audit_report_files.json }}"
+
+- name: Send the report by e-mail
+  when: mail.enabled | default(false) | bool
+  block:
+    - name: Check the SMTP settings injected by the AWX credential
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'SMTP_HOST') | length > 0
+          - lookup('env', 'SMTP_FROM') | length > 0
+          - mail.to | default([]) | length > 0
+        fail_msg: >-
+          SMTP_HOST / SMTP_FROM are not set (attach the "RHEL Audit SMTP" credential to the job
+          template) or mail.to is empty in group_vars/all.yml.
+        quiet: true
+
+    - name: Send the e-mail with the report attached
+      community.general.mail:
+        host: "{{ lookup('env', 'SMTP_HOST') }}"
+        port: "{{ lookup('env', 'SMTP_PORT') | default('587', true) | int }}"
+        secure: "{{ lookup('env', 'SMTP_SECURE') | default('starttls', true) }}"
+        username: "{{ lookup('env', 'SMTP_USERNAME') | default(omit, true) }}"
+        password: "{{ lookup('env', 'SMTP_PASSWORD') | default(omit, true) }}"
+        sender: "{{ lookup('env', 'SMTP_FROM') }}"
+        to: "{{ mail.to }}"
+        cc: "{{ mail.cc | default(omit, true) }}"
+        subject: "{{ audit_report_subject | trim }}"
+        subtype: html
+        charset: utf-8
+        body: "{{ lookup('ansible.builtin.template', 'email_body.html.j2') }}"
+        attach: >-
+          {{ ([audit_report_files.html] if (mail.attach_html | default(true) | bool) else [])
+             + ([audit_report_files.csv] if (mail.attach_csv | default(true) | bool) else [])
+             + ([audit_report_files.json] if (mail.attach_json | default(true) | bool) else []) }}
+        timeout: 30
+      no_log: "{{ not (audit_debug_mail | default(false) | bool) }}"
+  rescue:
+    - name: Report the e-mail failure
+      ansible.builtin.fail:
+        msg: >-
+          E-mail delivery failed (details are hidden because SMTP credentials are involved).
+          Check SMTP host/port/security/credentials/relay ACL, or re-run with the extra variable
+          audit_debug_mail=true. The reports were still written to {{ audit.report_dir }}.
+
+- name: Fail the job when critical findings exist (optional)
+  when:
+    - audit.fail_job_on_critical | default(false) | bool
+    - audit_report_data.summary.counts.CRITICAL | int > 0
+  ansible.builtin.fail:
+    msg: "{{ audit_report_data.summary.counts.CRITICAL }} CRITICAL finding(s) - see the report."

@@ -1,0 +1,5 @@
+---
+# Settings that differ per RHEL major version.
+# The file name must equal the AWX/Ansible group name (Linux is case-sensitive).
+audit_rhel_expected_major: "10"
+audit_needs_restarting_hint: "Install dnf-utils to provide needs-restarting"

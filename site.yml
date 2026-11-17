@@ -1,0 +1,121 @@
+---
+# Daily RHEL security & operational audit - READ ONLY.
+#
+#   Play 1  record which hosts were selected (no connection needed)
+#   Play 2  audit every host; a failing role on one host never stops the others
+#   Play 3  aggregate everything on the controller, build HTML/CSV/JSON, send e-mail
+#
+# Optional extra variables:
+#   audit_target_group   inventory group to audit (default: RHEL)
+#   audit_history_dir    directory where report copies are archived
+#   audit_debug_mail     true = show full output of the e-mail task (may expose secrets)
+
+- name: Register audit targets
+  hosts: "{{ audit_target_group | default('RHEL') }}"
+  gather_facts: false
+  check_mode: false
+  tasks:
+    - name: Remember every host selected for this run (including unreachable ones)
+      ansible.builtin.set_fact:
+        audit_target_hosts: "{{ ansible_play_hosts_all }}"
+      delegate_to: localhost
+      delegate_facts: true
+      run_once: true
+
+- name: Audit RHEL servers (read-only)
+  hosts: "{{ audit_target_group | default('RHEL') }}"
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - network
+  gather_timeout: 60
+  become: true
+  check_mode: false          # audit commands only read state; run them even in AWX "check" jobs
+  diff: false
+  strategy: linear
+  max_fail_percentage: 100   # one broken host must never stop the audit of the others
+
+  pre_tasks:
+    - name: Verify the audit configuration is loaded (group_vars/all.yml)
+      ansible.builtin.assert:
+        that:
+          - audit is defined
+          - security_baseline is defined
+          - firewall_baseline is defined
+          - mail is defined
+        fail_msg: "group_vars/all.yml is missing or incomplete - audit/security_baseline/firewall_baseline/mail must be defined."
+        quiet: true
+      run_once: true
+
+  tasks:
+    - name: Common facts and checks
+      block:
+        - name: Run audit_common
+          ansible.builtin.include_role:
+            name: audit_common
+      rescue:
+        - name: Record audit_common failure
+          ansible.builtin.set_fact:
+            audit_results: >-
+              {{ audit_results | default([])
+                 | audit_add('Audit framework', 'audit_common role', 'UNKNOWN',
+                             ansible_failed_result.msg | default('role failed'),
+                             'Role completes',
+                             'Role failed - remaining checks were skipped for this host') }}
+
+    - name: Security checks
+      when: audit_common_done | default(false) | bool
+      block:
+        - name: Run audit_security
+          ansible.builtin.include_role:
+            name: audit_security
+      rescue:
+        - name: Record audit_security failure
+          ansible.builtin.set_fact:
+            audit_results: >-
+              {{ audit_results | default([])
+                 | audit_add('Audit framework', 'audit_security role', 'UNKNOWN',
+                             ansible_failed_result.msg | default('role failed'),
+                             'Role completes',
+                             'Role failed - security checks may be incomplete') }}
+
+    - name: System and operational checks
+      when: audit_common_done | default(false) | bool
+      block:
+        - name: Run audit_system
+          ansible.builtin.include_role:
+            name: audit_system
+      rescue:
+        - name: Record audit_system failure
+          ansible.builtin.set_fact:
+            audit_results: >-
+              {{ audit_results | default([])
+                 | audit_add('Audit framework', 'audit_system role', 'UNKNOWN',
+                             ansible_failed_result.msg | default('role failed'),
+                             'Role completes',
+                             'Role failed - system checks may be incomplete') }}
+
+    - name: Server-specific checks
+      when: audit_common_done | default(false) | bool
+      block:
+        - name: Run audit_server_specific
+          ansible.builtin.include_role:
+            name: audit_server_specific
+      rescue:
+        - name: Record audit_server_specific failure
+          ansible.builtin.set_fact:
+            audit_results: >-
+              {{ audit_results | default([])
+                 | audit_add('Audit framework', 'audit_server_specific role', 'UNKNOWN',
+                             ansible_failed_result.msg | default('role failed'),
+                             'Role completes',
+                             'Role failed - server-specific checks may be incomplete') }}
+
+- name: Build reports and send e-mail
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  check_mode: false
+  roles:
+    - audit_report

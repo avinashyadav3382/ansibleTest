@@ -1,0 +1,161 @@
+---
+# =============================================================================
+# Global audit configuration  (common policy)
+# The values below are EXAMPLES. Replace them with your organisation's approved
+# security policy before production use. This is an audit framework, not a CIS
+# certification.
+# =============================================================================
+
+audit:
+  report_title: "Daily RHEL Security & Health Audit"
+  report_timezone: "Asia/Kolkata"      # only used to print the local time in the report
+
+  # Where report files are written on the controller / execution environment.
+  report_dir: "{{ lookup('env', 'AUDIT_REPORT_DIR') | default('/tmp/rhel-audit', true) }}"
+  # Optional persistent copy (NFS/object mount exposed to the execution environment).
+  # Set with env AUDIT_HISTORY_DIR or the job-template extra variable audit_history_dir.
+  history_dir: "{{ audit_history_dir | default(lookup('env', 'AUDIT_HISTORY_DIR'), true) }}"
+
+  # Print full aggregation output in the job log (large). Troubleshooting only.
+  debug: false
+  # true = AWX job ends "Failed" when any CRITICAL finding exists (useful for AWX notifications).
+  fail_job_on_critical: false
+
+  # --- disk ------------------------------------------------------------------
+  # < warning PASS | warning..critical-1 WARNING | >= critical CRITICAL
+  disk_default_warning: 80
+  disk_default_critical: 90
+  directory_default_warning: 80
+  directory_default_critical: 90
+  inode_warning: 80
+  inode_critical: 90
+  df_exclude_types: [tmpfs, devtmpfs, squashfs, overlay, iso9660, efivarfs]
+
+  # --- performance -----------------------------------------------------------
+  load_warning_per_cpu: 1.5            # 15-minute load average divided by CPU count
+  load_critical_per_cpu: 3.0
+  memory_warning_pct: 90               # used = MemTotal - MemAvailable
+  memory_critical_pct: 97
+  swap_warning_pct: 50
+  swap_critical_pct: 80
+  uptime_warning_days: 180             # long uptime usually means kernel patches are not applied
+
+  # --- time / network --------------------------------------------------------
+  ntp_offset_warning_seconds: 0.5
+  ntp_offset_critical_seconds: 5
+  dns_test_name: ""                    # e.g. "ntp.example.local"; empty = skip the lookup test
+
+  # --- patching --------------------------------------------------------------
+  updates_total_warning: 100
+  dnf_timeout_seconds: 300
+
+  # --- security log thresholds (last 24 h) -----------------------------------
+  auth_failures_warning: 20
+  auth_failures_critical: 200
+  avc_window: yesterday                # ausearch -ts value: recent | today | yesterday | this-week
+
+  # --- sudo ------------------------------------------------------------------
+  # sudoers lines containing NOPASSWD are flagged unless they contain one of these strings.
+  sudo_nopasswd_approved:
+    - ansible_audit
+
+  # --- services and ports ----------------------------------------------------
+  # Always allowed to run / always required, in addition to host_vars.
+  common_allowed_services: [sshd, chronyd, firewalld]
+  common_required_services: [sshd]
+  # Ports that are approved on every server (22/tcp = SSH).
+  common_expected_ports: ["22/tcp"]
+  # Listening ports to ignore completely (non-loopback ports you do not want to track).
+  listening_ignore_ports: []
+  # Running services that match these regular expressions (whole unit name, without
+  # ".service") are treated as normal OS plumbing and are not compared with the
+  # approved-service list. Network-facing daemons are deliberately NOT listed.
+  service_ignore_patterns:
+    - 'atd'
+    - 'auditd'
+    - 'crond'
+    - 'dbus(-broker|-daemon)?'
+    - 'getty@.*'
+    - 'serial-getty@.*'
+    - 'insights-client.*'
+    - 'irqbalance'
+    - 'lvm2-.*'
+    - 'mdmonitor'
+    - 'multipathd'
+    - 'NetworkManager'
+    - 'open-vm-tools'
+    - 'polkit'
+    - 'qemu-guest-agent'
+    - 'rhcd'
+    - 'rhsmcertd'
+    - 'rsyslog'
+    - 'smartd'
+    - 'sssd.*'
+    - 'sysstat'
+    - 'systemd-.*'
+    - 'tuned'
+    - 'udisks2'
+    - 'user@.*'
+    - 'user-runtime-dir@.*'
+    - 'vmtoolsd'
+    - 'VGAuthService'
+
+security_baseline:
+  password:
+    min_length: 14
+    max_days: 90
+    min_days: 1
+    warn_days: 14
+    remember: 5
+
+  # Keys are sshd option names (underscores are ignored: permit_root_login = PermitRootLogin).
+  # Compared with the EFFECTIVE configuration reported by `sshd -T`.
+  # Quote yes/no values. A value may also be a list of accepted values.
+  ssh:
+    permit_root_login: "no"
+    password_authentication: "no"
+    permit_empty_passwords: "no"
+    x11_forwarding: "no"
+    max_auth_tries: "4"
+
+  selinux:
+    mode: "enforcing"
+
+firewall_baseline:
+  # Explicit firewalld ports and service objects that may be open on EVERY server.
+  # Per-server additions: host_vars `expected_ports` (also treated as approved here)
+  # or `firewall_baseline_extra: {allowed_ports: [], allowed_services: [], allowed_sources: []}`.
+  # NOTE: stock RHEL zones often also contain dhcpv6-client and cockpit - add them
+  # here if your policy approves them, otherwise they are reported as FAIL.
+  allowed_ports:
+    - 22/tcp
+    - 443/tcp
+  allowed_services:
+    - ssh
+    - https
+  allowed_sources: []
+  require_firewalld: true
+
+# Optional per-host variables (put them in host_vars/<host>.yml):
+#   server_role: [database]                       shown in the report
+#   expected_services: {allowed: [...], required: [...]}
+#   expected_ports: ["22/tcp", "3306/tcp"]
+#   filesystem_thresholds: {"/var": {warning: 70, critical: 85}}
+#   directory_checks: [{path: /var/log, warning: 70, critical: 85, optional: false, include_size: false}]
+#   backup_checks / database_checks / certificate_checks / heartbeat_check
+#   approved_interactive_users: [alice, bob]      enforce the list of login accounts
+#   approved_wheel_members: [alice]               enforce the sudo (wheel) group
+
+mail:
+  enabled: true
+  to:
+    - security-team@example.com
+    - noc-team@example.com
+  cc: []
+  subject_prefix: "Daily RHEL Security & Health Audit"
+  attach_html: true
+  attach_csv: true
+  attach_json: true
+  max_findings_in_body: 75             # remaining findings are in the attached report
+# SMTP host/port/user/password/sender come from the AWX credential "RHEL Audit SMTP"
+# (environment variables SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM).

@@ -1,0 +1,60 @@
+{%- set r = audit_report_data -%}
+{%- set colors = {'CRITICAL': '#b71c1c', 'FAIL': '#e65100', 'WARNING': '#f9a825', 'UNKNOWN': '#6a1b9a', 'PASS': '#2e7d32', 'NOT_APPLICABLE': '#757575'} -%}
+{%- set limit = mail.max_findings_in_body | default(75) | int -%}
+{%- macro badge(status) -%}<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:{{ colors[status] }};color:{{ '#212121' if status == 'WARNING' else '#ffffff' }};font-size:11px;font-weight:bold;">{{ status | replace('_', ' ') }}</span>{%- endmacro -%}
+<html>
+<body style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#212121;">
+<h2 style="margin:0 0 4px 0;">{{ r.title | e }}</h2>
+<p style="margin:0 0 12px 0;color:#546e7a;">Generated {{ r.generated_utc | e }}{% if r.generated_local %} ({{ r.generated_local | e }}){% endif %}</p>
+
+<p style="padding:10px 14px;border-radius:4px;background:{{ colors[r.summary.overall] }};color:{{ '#212121' if r.summary.overall == 'WARNING' else '#ffffff' }};font-weight:bold;">
+  Overall status: {{ r.summary.overall | replace('_', ' ') }} &mdash;
+  {{ r.summary.hosts_clean }} of {{ r.summary.hosts_total }} server(s) clean{% if r.summary.hosts_without_data %}, {{ r.summary.hosts_without_data }} without audit data{% endif %}
+</p>
+
+<table cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+  <tr>
+  {% for s in ['CRITICAL', 'FAIL', 'WARNING', 'UNKNOWN', 'PASS', 'NOT_APPLICABLE'] %}
+    <td style="border:1px solid #dde3e8;text-align:center;border-top:4px solid {{ colors[s] }};min-width:80px;"><div style="font-size:22px;font-weight:bold;">{{ r.summary.counts[s] }}</div><div style="font-size:11px;color:#546e7a;">{{ s | replace('_', ' ') }}</div></td>
+  {% endfor %}
+  </tr>
+</table>
+
+<h3>Servers</h3>
+<table cellpadding="5" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+  <tr style="background:#eceff1;"><th align="left" style="border:1px solid #dde3e8;">Server</th><th align="left" style="border:1px solid #dde3e8;">OS</th><th align="left" style="border:1px solid #dde3e8;">Status</th>
+      <th style="border:1px solid #dde3e8;">C</th><th style="border:1px solid #dde3e8;">F</th><th style="border:1px solid #dde3e8;">W</th><th style="border:1px solid #dde3e8;">U</th></tr>
+{% for h in r.hosts %}
+  <tr>
+    <td style="border:1px solid #dde3e8;">{{ h.name | e }}</td>
+    <td style="border:1px solid #dde3e8;">{{ h.os | e }}</td>
+    <td style="border:1px solid #dde3e8;">{{ badge(h.status) }}</td>
+    <td align="center" style="border:1px solid #dde3e8;">{{ h.counts.CRITICAL }}</td><td align="center" style="border:1px solid #dde3e8;">{{ h.counts.FAIL }}</td>
+    <td align="center" style="border:1px solid #dde3e8;">{{ h.counts.WARNING }}</td><td align="center" style="border:1px solid #dde3e8;">{{ h.counts.UNKNOWN }}</td>
+  </tr>
+{% endfor %}
+</table>
+
+<h3>Findings requiring attention ({{ r.attention | length }})</h3>
+{% if r.attention %}
+<table cellpadding="5" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+  <tr style="background:#eceff1;"><th align="left" style="border:1px solid #dde3e8;">Severity</th><th align="left" style="border:1px solid #dde3e8;">Server</th>
+      <th align="left" style="border:1px solid #dde3e8;">Check</th><th align="left" style="border:1px solid #dde3e8;">Actual</th><th align="left" style="border:1px solid #dde3e8;">Finding</th></tr>
+{% for f in r.attention[:limit] %}
+  <tr>
+    <td style="border:1px solid #dde3e8;">{{ badge(f.status) }}</td>
+    <td style="border:1px solid #dde3e8;">{{ f.host | e }}</td>
+    <td style="border:1px solid #dde3e8;">{{ f.check | e }}</td>
+    <td style="border:1px solid #dde3e8;">{{ f.actual | e }}</td>
+    <td style="border:1px solid #dde3e8;">{{ f.finding | e }}</td>
+  </tr>
+{% endfor %}
+</table>
+{% if r.attention | length > limit %}<p>{{ r.attention | length - limit }} more finding(s) are in the attached report.</p>{% endif %}
+{% else %}
+<p>No CRITICAL, FAIL, WARNING or UNKNOWN findings.</p>
+{% endif %}
+
+<p style="color:#78909c;font-size:12px;margin-top:20px;">The full report (HTML), the CSV and the JSON are attached. This is a read-only audit against the approved baselines in Git; it is not a CIS certification.</p>
+</body>
+</html>
