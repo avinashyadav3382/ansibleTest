@@ -1,0 +1,28 @@
+- name: Build reports and send e-mail
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  check_mode: false
+
+  vars:
+    audit_history_dir: /var/lib/awx/reports
+
+  pre_tasks:
+    - name: Create persistent report directory
+      ansible.builtin.file:
+        path: "{{ audit_history_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Test persistent report storage
+      ansible.builtin.copy:
+        content: |
+          AWX persistent storage test
+          Job: {{ awx_job_id | default('manual') }}
+          Date: {{ lookup('pipe', 'date') }}
+        dest: "{{ audit_history_dir }}/test.txt"
+        mode: "0644"
+
+  roles:
+    - audit_report
